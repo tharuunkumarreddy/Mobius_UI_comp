@@ -1,0 +1,377 @@
+name: phase2_model_definition
+display_name: Phase 2 Model Definition (CLIP)
+description: Defines CLIP-based models for component classification within categories
+
+parameters:
+  label_mappings_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory containing label mappings
+  
+  clip_model_name:
+    type: str
+    default: "ViT-B/32"
+    options: ["ViT-B/32", "ViT-B/16", "ViT-L/14"]
+    description: CLIP model variant to use
+  
+  dropout_rate:
+    type: float
+    default: 0.1
+    validation:
+      min: 0.0
+      max: 0.8
+    description: Dropout rate for classification head
+  
+  custom_head_layers:
+    type: list
+    default: []
+    description: Additional hidden layers in classification head
+  
+  freeze_clip_layers:
+    type: list
+    default: []
+    description: CLIP layers to freeze during training
+
+inputs:
+  component_mappings:
+    type: file
+    format: json
+    description: Component mappings per category
+    path: "{label_mappings_dir}/component_mappings.json"
+
+outputs:
+  clip_models:
+    type: dict
+    description: Dictionary of CLIP models per category
+  
+  model_configs:
+    type: dict
+    description: Model configuration for each category
+  
+  model_summaries:
+    type: dict
+    description: Model architecture summaries per category
+
+code: |
+  import torch
+  import torch.nn as nn
+  import json
+  from pathlib import Path
+  from collections import defaultdict
+  
+  # Install CLIP if not available
+  try:
+      import clip
+  except ImportError:
+      import subprocess
+      import sys
+      print("Installing CLIP...")
+      subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/openai/CLIP.git"])
+      import clip
+  
+  # Load component mappings
+  mappings_dir = Path(label_mappings_dir)
+  
+  try:
+      with open(mappings_dir / "component_mappings.json") as f:
+          component_mappings = json.load(f)
+      
+      with open(mappings_dir / "mapping_summary.json") as f:
+          mapping_summary = json.load(f)
+  except FileNotFoundError as e:
+      raise FileNotFoundError(f"Component mapping files not found in {mappings_dir}. Run label_mapping brick first.")
+  
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  
+  def get_clip_model_info(model_name):
+      """Get CLIP model information"""
+      model_info = {
+          "ViT-B/32": {"feature_dim": 512, "image_resolution": 224, "patch_size": 32},
+          "ViT-B/16": {"feature_dim": 512, "image_resolution": 224, "patch_size": 16},
+          "ViT-L/14": {"feature_dim": 768, "image_resolution": 224, "patch_size": 14}
+      }
+      
+      if model_name not in model_info:
+          raise ValueError(f"Unsupported CLIP model: {model_name}")
+      
+      return model_info[model_name]
+  
+  def create_classification_head(input_dim, output_dim, hidden_layers, dropout_rate):
+      """Create classification head with optional hidden layers"""
+      if not hidden_layers:
+          # Simple head
+          return nn.Sequential(
+              nn.Dropout(dropout_rate),
+              nn.Linear(input_dim, output_dim)
+          )
+      
+      # Complex head with hidden layers
+      layers = []
+      current_dim = input_dim
+      
+      for hidden_dim in hidden_layers:
+          layers.extend([
+              nn.Dropout(dropout_rate),
+              nn.Linear(current_dim, hidden_dim),
+              nn.ReLU(inplace=True),
+              nn.BatchNorm1d(hidden_dim)
+          ])
+          current_dim = hidden_dim
+      
+      # Final layer
+      layers.extend([
+          nn.Dropout(dropout_rate),
+          nn.Linear(current_dim, output_dim)
+      ])
+      
+      return nn.Sequential(*layers)
+  
+  class CLIPComponentClassifier(nn.Module):
+      """CLIP-based component classifier for a specific category"""
+      
+      def __init__(self, clip_model, num_components, category_name, 
+                   dropout_rate=0.1, custom_head_layers=None, freeze_layers=None):
+          super(CLIPComponentClassifier, self).__init__()
+          
+          if custom_head_layers is None:
+              custom_head_layers = []
+          if freeze_layers is None:
+              freeze_layers = []
+          
+          self.clip_model = clip_model
+          self.category_name = category_name
+          self.feature_dim = clip_model.visual.output_dim
+          self.num_components = num_components
+          self.custom_head_layers = custom_head_layers
+          self.freeze_layers = freeze_layers
+          
+          # Classification head
+          self.head = create_classification_head(
+              self.feature_dim, num_components, custom_head_layers, dropout_rate
+          )
+          
+          # Ensure CLIP model is in float32
+          self.clip_model.float()
+          
+          # Freeze specified layers
+          if freeze_layers:
+              self._freeze_layers(freeze_layers)
+          
+      def _freeze_layers(self, layer_patterns):
+          """Freeze layers matching patterns"""
+          frozen_count = 0
+          for name, param in self.clip_model.named_parameters():
+              if any(pattern in name for pattern in layer_patterns):
+                  param.requires_grad = False
+                  frozen_count += 1
+          print(f"  Frozen {frozen_count} CLIP parameters for {self.category_name}")
+      
+      def forward(self, images):
+          # Extract CLIP features
+          features = self.clip_model.encode_image(images)
+          features = features / features.norm(dim=-1, keepdim=True)  # L2 normalize
+          features = features.float()  # Ensure float32
+          
+          # Classify with head
+          logits = self.head(features)
+          return logits
+      
+      def get_features(self, images):
+          """Extract normalized CLIP features"""
+          with torch.no_grad():
+              features = self.clip_model.encode_image(images)
+              features = features / features.norm(dim=-1, keepdim=True)
+              return features.float()
+      
+      def get_clip_parameters(self):
+          """Get CLIP model parameters separately from head"""
+          return self.clip_model.parameters()
+      
+      def get_head_parameters(self):
+          """Get classification head parameters"""
+          return self.head.parameters()
+      
+      def unfreeze_layers(self, layer_patterns):
+          """Unfreeze layers matching patterns"""
+          unfrozen_count = 0
+          for name, param in self.clip_model.named_parameters():
+              if any(pattern in name for pattern in layer_patterns):
+                  param.requires_grad = True
+                  unfrozen_count += 1
+          print(f"  Unfrozen {unfrozen_count} CLIP parameters for {self.category_name}")
+  
+  def create_category_models(categories, component_mappings, clip_model_name, 
+                           dropout_rate, custom_head_layers, freeze_layers):
+      """Create CLIP models for each category"""
+      models = {}
+      configs = {}
+      summaries = {}
+      
+      clip_info = get_clip_model_info(clip_model_name)
+      
+      print(f"Creating CLIP models using {clip_model_name}...")
+      print(f"Feature dimension: {clip_info['feature_dim']}")
+      print(f"Image resolution: {clip_info['image_resolution']}x{clip_info['image_resolution']}")
+      
+      total_models_created = 0
+      total_parameters = 0
+      
+      for category in categories:
+          if category not in component_mappings:
+              print(f"Warning: No component mapping found for category: {category}")
+              continue
+          
+          num_components = component_mappings[category]["num_components"]
+          components = component_mappings[category]["components"]
+          
+          print(f"\nCreating model for {category} ({num_components} components)...")
+          
+          # Load fresh CLIP model for each category
+          clip_model, _ = clip.load(clip_model_name, device=device)
+          
+          # Create classifier
+          model = CLIPComponentClassifier(
+              clip_model=clip_model,
+              num_components=num_components,
+              category_name=category,
+              dropout_rate=dropout_rate,
+              custom_head_layers=custom_head_layers,
+              freeze_layers=freeze_layers
+          )
+          
+          model.to(device)
+          
+          # Calculate parameter counts
+          clip_params = sum(p.numel() for p in model.get_clip_parameters())
+          head_params = sum(p.numel() for p in model.get_head_parameters())
+          total_params = clip_params + head_params
+          trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+          
+          models[category] = model
+          configs[category] = {
+              "clip_model_name": clip_model_name,
+              "num_components": num_components,
+              "dropout_rate": dropout_rate,
+              "custom_head_layers": custom_head_layers,
+              "freeze_layers": freeze_layers,
+              "feature_dim": model.feature_dim,
+              "components": components,
+              "component_to_idx": component_mappings[category]["component_to_idx"],
+              "idx_to_component": component_mappings[category]["idx_to_component"],
+              "total_params": total_params,
+              "clip_params": clip_params,
+              "head_params": head_params,
+              "trainable_params": trainable_params
+          }
+          
+          # Model summary
+          summaries[category] = {
+              "architecture": f"CLIP-{clip_model_name}",
+              "category": category,
+              "num_components": num_components,
+              "components": components,
+              "parameter_breakdown": {
+                  "total": total_params,
+                  "clip_backbone": clip_params,
+                  "classification_head": head_params,
+                  "trainable": trainable_params,
+                  "frozen": total_params - trainable_params,
+                  "trainable_percentage": (trainable_params / total_params) * 100
+              },
+              "model_config": {
+                  "clip_model": clip_model_name,
+                  "feature_dim": model.feature_dim,
+                  "head_architecture": custom_head_layers,
+                  "dropout_rate": dropout_rate,
+                  "frozen_layers": freeze_layers
+              },
+              "memory_estimate_mb": (total_params * 4) / (1024 * 1024)
+          }
+          
+          total_models_created += 1
+          total_parameters += total_params
+          
+          print(f"  Total parameters: {total_params:,}")
+          print(f"  Trainable parameters: {trainable_params:,} ({(trainable_params/total_params)*100:.1f}%)")
+          
+          # Test forward pass
+          try:
+              with torch.no_grad():
+                  dummy_input = torch.randn(2, 3, clip_info['image_resolution'], 
+                                          clip_info['image_resolution']).to(device)
+                  output = model(dummy_input)
+                  features = model.get_features(dummy_input)
+                  
+              summaries[category]["forward_pass_validation"] = {
+                  "input_shape": list(dummy_input.shape),
+                  "features_shape": list(features.shape),
+                  "output_shape": list(output.shape),
+                  "success": True
+              }
+              print(f"  ✅ Forward pass successful: {dummy_input.shape} -> {output.shape}")
+              
+          except Exception as e:
+              summaries[category]["forward_pass_validation"] = {
+                  "success": False,
+                  "error": str(e)
+              }
+              print(f"  ❌ Forward pass failed: {e}")
+      
+      return models, configs, summaries, total_models_created, total_parameters
+  
+  # Get categories from component mappings
+  categories = list(component_mappings.keys())
+  
+  print(f"Found {len(categories)} categories: {categories}")
+  print(f"Total components across all categories: {sum(len(comp_data['components']) for comp_data in component_mappings.values())}")
+  
+  # Create models for all categories
+  clip_models, model_configs, model_summaries, total_models, total_params = create_category_models(
+      categories=categories,
+      component_mappings=component_mappings,
+      clip_model_name=clip_model_name,
+      dropout_rate=dropout_rate,
+      custom_head_layers=custom_head_layers,
+      freeze_layers=freeze_clip_layers
+  )
+  
+  print(f"\n" + "="*60)
+  print("PHASE 2 MODEL DEFINITION SUMMARY")
+  print("="*60)
+  print(f"CLIP Model: {clip_model_name}")
+  print(f"Device: {device}")
+  print(f"Categories: {len(clip_models)}")
+  print(f"Total models created: {total_models}")
+  print(f"Total parameters across all models: {total_params:,}")
+  print(f"Estimated total memory: {(total_params * 4) / (1024 * 1024):.1f} MB")
+  
+  if custom_head_layers:
+      print(f"Custom head layers: {custom_head_layers}")
+  if freeze_clip_layers:
+      print(f"Frozen layer patterns: {freeze_clip_layers}")
+  
+  print(f"\nPer-category breakdown:")
+  for category, config in model_configs.items():
+      print(f"  {category}:")
+      print(f"    Components: {config['num_components']}")
+      print(f"    Parameters: {config['total_params']:,} ({config['trainable_params']:,} trainable)")
+      print(f"    Memory: {(config['total_params'] * 4) / (1024 * 1024):.1f} MB")
+  
+  print(f"\n✅ Phase 2 models ready for training!")
+
+requirements:
+  - torch>=1.12.0
+  - torchvision>=0.13.0
+  - git+https://github.com/openai/CLIP.git
+  - pillow
+  - numpy
+
+tags:
+  - model-definition
+  - clip
+  - computer-vision
+  - phase2
+  - component-classification
+  - mlops
+
+version: "1.0.0"

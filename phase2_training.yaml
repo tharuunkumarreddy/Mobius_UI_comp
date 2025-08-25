@@ -1,0 +1,614 @@
+name: phase2_training
+display_name: Phase 2 Training (Component Classification)
+description: Trains specialized CLIP models for component classification within each category
+
+parameters:
+  data_root:
+    type: str
+    default: "./dataset_split"
+    description: Root directory of split dataset
+  
+  label_mappings_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory containing label mappings
+  
+  epochs:
+    type: int
+    default: 15
+    validation:
+      min: 1
+      max: 100
+    description: Number of training epochs per category
+  
+  batch_size:
+    type: int
+    default: 16
+    validation:
+      min: 1
+      max: 128
+    description: Batch size for training
+  
+  lr_head:
+    type: float
+    default: 1e-3
+    validation:
+      min: 1e-6
+      max: 1e-1
+    description: Learning rate for classification head
+  
+  lr_backbone:
+    type: float
+    default: 1e-5
+    validation:
+      min: 1e-7
+      max: 1e-2
+    description: Learning rate for CLIP backbone fine-tuning
+  
+  weight_decay:
+    type: float
+    default: 1e-4
+    validation:
+      min: 0.0
+      max: 1e-1
+    description: Weight decay for regularization
+  
+  output_dir:
+    type: str
+    default: "./phase2_clip_models"
+    description: Directory to save model checkpoints
+  
+  num_workers:
+    type: int
+    default: 2
+    description: Number of data loading workers
+  
+  early_stopping_patience:
+    type: int
+    default: 5
+    description: Early stopping patience (0 = disabled)
+  
+  save_intermediate:
+    type: bool
+    default: false
+    description: Save intermediate epoch checkpoints
+
+inputs:
+  clip_models:
+    type: dict
+    description: Dictionary of CLIP models per category
+  
+  split_dataset:
+    type: dataset
+    description: Dataset with train/val/test splits
+    path: "{data_root}"
+  
+  component_mappings:
+    type: file
+    format: json
+    description: Component mappings per category
+    path: "{label_mappings_dir}/component_mappings.json"
+
+outputs:
+  trained_models:
+    type: dict
+    description: Dictionary of trained CLIP model checkpoints
+  
+  training_results:
+    type: file
+    format: json
+    description: Training results summary
+    path: "{output_dir}/training_results.json"
+  
+  training_logs:
+    type: file
+    format: json
+    description: Detailed training logs per category
+    path: "{output_dir}/training_logs.json"
+
+code: |
+  import os
+  import time
+  import json
+  from pathlib import Path
+  import torch
+  import torch.nn as nn
+  import torch.optim as optim
+  from torch.utils.data import Dataset, DataLoader
+  from torchvision import transforms
+  from PIL import Image
+  from collections import defaultdict
+  import numpy as np
+  
+  # Setup paths
+  data_dir = Path(data_root)
+  mappings_dir = Path(label_mappings_dir)
+  output_dir = Path(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  
+  # Load component mappings
+  try:
+      with open(mappings_dir / "component_mappings.json") as f:
+          component_mappings = json.load(f)
+  except FileNotFoundError as e:
+      raise FileNotFoundError(f"Component mappings not found. Run label_mapping brick first.")
+  
+  # Image extensions
+  IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+  
+  class CategoryComponentDataset(Dataset):
+      """Dataset for loading images from a specific category with component-level labels."""
+      def __init__(self, root: Path, category: str, component_mappings: dict, split: str = "train", transform=None):
+          self.transform = transform
+          self.category = category
+          self.split = split
+          
+          # Get components for this category
+          if category not in component_mappings:
+              raise ValueError(f"No components found for category: {category}")
+          
+          self.component_to_idx = component_mappings[category]["component_to_idx"]
+          self.components = component_mappings[category]["components"]
+          
+          # Build samples list
+          self.samples = []
+          self.component_counts = defaultdict(int)
+          category_folder = root / split / category
+          
+          if not category_folder.exists():
+              raise FileNotFoundError(f"Category folder not found: {category_folder}")
+          
+          print(f"  Loading {split} data for {category}...")
+          for component in self.components:
+              component_dir = category_folder / component
+              if component_dir.exists():
+                  count = 0
+                  for img_path in component_dir.iterdir():
+                      if img_path.suffix.lower() in IMG_EXTS:
+                          self.samples.append((img_path, self.component_to_idx[component]))
+                          count += 1
+                  self.component_counts[component] = count
+                  print(f"    {component}: {count} images")
+              else:
+                  print(f"    Warning: Component directory not found: {component_dir}")
+          
+          if len(self.samples) == 0:
+              raise ValueError(f"No samples found for category {category} in {split} split")
+          
+          print(f"  Total samples: {len(self.samples)}")
+
+      def __len__(self):
+          return len(self.samples)
+
+      def __getitem__(self, idx):
+          img_path, label = self.samples[idx]
+          try:
+              img = Image.open(img_path).convert("RGB")
+              if self.transform:
+                  img = self.transform(img)
+              return img, label
+          except Exception as e:
+              print(f"Error loading image {img_path}: {e}")
+              # Return a black image as fallback
+              img = Image.new('RGB', (224, 224), color=(0, 0, 0))
+              if self.transform:
+                  img = self.transform(img)
+              return img, label
+
+  def create_clip_transforms():
+      """Create CLIP-compatible transforms"""
+      train_transform = transforms.Compose([
+          transforms.Resize((224, 224)),
+          transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+          transforms.RandomHorizontalFlip(p=0.5),
+          transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+          transforms.ToTensor(),
+          transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
+                             std=[0.26862954, 0.26130258, 0.27577711])
+      ])
+      
+      val_transform = transforms.Compose([
+          transforms.Resize((224, 224)),
+          transforms.ToTensor(),
+          transforms.Normalize(mean=[0.48145466, 0.4578275, 0.40821073], 
+                             std=[0.26862954, 0.26130258, 0.27577711])
+      ])
+      
+      return train_transform, val_transform
+
+  def evaluate_model(model, data_loader, device):
+      """Evaluate the model on given data loader."""
+      model.eval()
+      correct = 0
+      total = 0
+      all_predictions = []
+      all_targets = []
+      
+      with torch.no_grad():
+          for imgs, labels in data_loader:
+              imgs, labels = imgs.to(device), labels.to(device)
+              logits = model(imgs)
+              _, predicted = torch.max(logits.data, 1)
+              
+              total += labels.size(0)
+              correct += (predicted == labels).sum().item()
+              
+              all_predictions.extend(predicted.cpu().numpy())
+              all_targets.extend(labels.cpu().numpy())
+      
+      accuracy = 100 * correct / total if total > 0 else 0
+      return accuracy, all_predictions, all_targets
+
+  def calculate_class_weights(dataset, num_classes):
+      """Calculate class weights for imbalanced datasets"""
+      class_counts = torch.zeros(num_classes)
+      
+      for _, label in dataset:
+          class_counts[label] += 1
+      
+      total_samples = len(dataset)
+      class_weights = total_samples / (num_classes * class_counts)
+      
+      # Handle zero counts
+      class_weights[class_counts == 0] = 0
+      
+      # Normalize weights
+      if class_weights.sum() > 0:
+          class_weights = class_weights / class_weights.sum() * num_classes
+      
+      return class_weights
+
+  def train_category_model(category: str, model, component_mappings):
+      """Train a specialized CLIP model for a specific category."""
+      print(f"\n{'='*80}")
+      print(f"TRAINING CATEGORY: {category.upper()}")
+      print(f"{'='*80}")
+      
+      num_classes = len(component_mappings[category]["components"])
+      components = component_mappings[category]["components"]
+      
+      print(f"Components ({num_classes}): {components}")
+      
+      # Create transforms
+      train_transform, val_transform = create_clip_transforms()
+      
+      # Create datasets
+      try:
+          train_dataset = CategoryComponentDataset(
+              data_dir, category, component_mappings, "train", train_transform
+          )
+          val_dataset = CategoryComponentDataset(
+              data_dir, category, component_mappings, "val", val_transform
+          )
+          
+          # Create data loaders
+          train_loader = DataLoader(
+              train_dataset, batch_size=batch_size, shuffle=True, 
+              num_workers=num_workers, pin_memory=True, drop_last=True
+          )
+          val_loader = DataLoader(
+              val_dataset, batch_size=batch_size, shuffle=False, 
+              num_workers=num_workers, pin_memory=True
+          )
+          
+      except Exception as e:
+          print(f"❌ Error creating datasets for {category}: {e}")
+          return {
+              "category": category,
+              "status": "failed",
+              "error": str(e),
+              "best_val_acc": 0.0
+          }
+      
+      # Calculate class weights for imbalanced dataset
+      class_weights = calculate_class_weights(train_dataset, num_classes)
+      print(f"Class weights range: [{class_weights.min():.3f}, {class_weights.max():.3f}]")
+      
+      # Setup optimizer with different learning rates
+      optimizer = optim.AdamW([
+          {"params": model.get_head_parameters(), "lr": lr_head, "weight_decay": weight_decay},
+          {"params": model.get_clip_parameters(), "lr": lr_backbone, "weight_decay": weight_decay * 0.1}
+      ])
+      
+      # Setup loss with class weights
+      criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+      
+      # Setup learning rate scheduler
+      scheduler = optim.lr_scheduler.CosineAnnealingLR(
+          optimizer, T_max=epochs, eta_min=lr_backbone * 0.1
+      )
+      
+      # Training state
+      best_val_acc = 0.0
+      best_epoch = 0
+      patience_counter = 0
+      
+      training_log = {
+          "category": category,
+          "num_components": num_classes,
+          "train_samples": len(train_dataset),
+          "val_samples": len(val_dataset),
+          "epochs": [],
+          "component_distribution": dict(train_dataset.component_counts)
+      }
+      
+      print(f"Starting training for {epochs} epochs...")
+      print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
+      print(f"Batch size: {batch_size}, Batches per epoch: {len(train_loader)}")
+      
+      for epoch in range(1, epochs + 1):
+          model.train()
+          
+          running_loss = 0.0
+          correct = 0
+          total = 0
+          
+          start_time = time.time()
+          
+          for batch_idx, (imgs, labels) in enumerate(train_loader):
+              imgs, labels = imgs.to(device), labels.to(device)
+              
+              optimizer.zero_grad()
+              
+              # Forward pass
+              logits = model(imgs)
+              loss = criterion(logits, labels)
+              
+              # Backward pass
+              loss.backward()
+              
+              # Gradient clipping
+              torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+              
+              optimizer.step()
+              
+              # Statistics
+              running_loss += loss.item()
+              _, predicted = torch.max(logits.data, 1)
+              total += labels.size(0)
+              correct += (predicted == labels).sum().item()
+              
+              # Progress logging
+              if (batch_idx + 1) % max(1, len(train_loader) // 5) == 0:
+                  current_acc = 100 * correct / total
+                  print(f"  Epoch {epoch:2d} [{batch_idx+1:3d}/{len(train_loader)}] | "
+                        f"Loss: {loss.item():.4f} | Acc: {current_acc:.2f}%")
+          
+          # Calculate epoch metrics
+          train_acc = 100 * correct / total if total > 0 else 0
+          train_loss = running_loss / len(train_loader)
+          
+          # Validation
+          val_acc, val_preds, val_targets = evaluate_model(model, val_loader, device)
+          
+          # Update learning rate
+          scheduler.step()
+          current_lr = scheduler.get_last_lr()
+          
+          epoch_time = time.time() - start_time
+          
+          # Log epoch results
+          epoch_log = {
+              "epoch": epoch,
+              "train_loss": train_loss,
+              "train_acc": train_acc,
+              "val_acc": val_acc,
+              "learning_rates": current_lr,
+              "epoch_time": epoch_time
+          }
+          training_log["epochs"].append(epoch_log)
+          
+          print(f"  Epoch {epoch:2d}/{epochs} | {epoch_time:.1f}s")
+          print(f"    Train: loss={train_loss:.4f}, acc={train_acc:.2f}%")
+          print(f"    Val:   acc={val_acc:.2f}%")
+          print(f"    LR:    head={current_lr[0]:.2e}, backbone={current_lr[1]:.2e}")
+          
+          # Save best model
+          if val_acc > best_val_acc:
+              best_val_acc = val_acc
+              best_epoch = epoch
+              patience_counter = 0
+              
+              # Save model state
+              best_model_path = output_dir / f"{category.lower()}_clip_best.pt"
+              
+              save_dict = {
+                  'clip_model_state': model.clip_model.state_dict(),
+                  'head_state': model.head.state_dict(),
+                  'component_to_idx': component_mappings[category]['component_to_idx'],
+                  'idx_to_component': component_mappings[category]['idx_to_component'],
+                  'components': component_mappings[category]['components'],
+                  'category': category,
+                  'val_acc': val_acc,
+                  'epoch': epoch,
+                  'feature_dim': model.feature_dim,
+                  'model_config': {
+                      'clip_model_name': 'ViT-B/32',  # This should come from model config
+                      'dropout_rate': 0.1,  # This should come from model config
+                      'num_components': num_classes
+                  },
+                  'training_config': {
+                      'lr_head': lr_head,
+                      'lr_backbone': lr_backbone,
+                      'weight_decay': weight_decay,
+                      'batch_size': batch_size,
+                      'epochs': epochs
+                  }
+              }
+              
+              torch.save(save_dict, best_model_path)
+              print(f"    ✅ New best model saved! Val acc: {val_acc:.2f}%")
+          else:
+              patience_counter += 1
+          
+          # Save intermediate checkpoint
+          if save_intermediate and epoch % 5 == 0:
+              intermediate_path = output_dir / f"{category.lower()}_epoch_{epoch}.pt"
+              torch.save(save_dict, intermediate_path)
+          
+          # Early stopping check
+          if early_stopping_patience > 0 and patience_counter >= early_stopping_patience:
+              print(f"    ⏹️  Early stopping at epoch {epoch} (patience: {patience_counter})")
+              break
+      
+      # Calculate per-component accuracy
+      component_performance = defaultdict(lambda: {"correct": 0, "total": 0})
+      idx_to_component = component_mappings[category]['idx_to_component']
+      
+      for pred, target in zip(val_preds, val_targets):
+          component = idx_to_component[str(target)]
+          component_performance[component]["total"] += 1
+          if pred == target:
+              component_performance[component]["correct"] += 1
+      
+      component_accuracies = {}
+      for component, stats in component_performance.items():
+          acc = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+          component_accuracies[component] = {
+              "accuracy": acc,
+              "correct": stats["correct"],
+              "total": stats["total"]
+          }
+      
+      # Final results
+      result = {
+          "category": category,
+          "status": "completed",
+          "best_val_acc": best_val_acc,
+          "best_epoch": best_epoch,
+          "final_val_acc": val_acc,
+          "total_epochs": epoch,
+          "num_components": num_classes,
+          "train_samples": len(train_dataset),
+          "val_samples": len(val_dataset),
+          "component_accuracies": component_accuracies,
+          "training_time": sum(ep["epoch_time"] for ep in training_log["epochs"]),
+          "avg_epoch_time": np.mean([ep["epoch_time"] for ep in training_log["epochs"]])
+      }
+      
+      training_log["final_result"] = result
+      
+      print(f"\n  Training completed for {category}")
+      print(f"  Best validation accuracy: {best_val_acc:.2f}% (epoch {best_epoch})")
+      print(f"  Final validation accuracy: {val_acc:.2f}%")
+      print(f"  Total training time: {result['training_time']:.1f}s")
+      
+      # Print component-wise performance
+      print(f"  Component performance:")
+      for component, perf in component_accuracies.items():
+          print(f"    {component}: {perf['accuracy']:.3f} ({perf['correct']}/{perf['total']})")
+      
+      return result, training_log
+
+  # Main training loop for all categories
+  print("="*80)
+  print("PHASE 2: TRAINING SPECIALIZED CLIP MODELS")
+  print("="*80)
+  print(f"Device: {device}")
+  print(f"Categories to train: {len(component_mappings)}")
+  print(f"Epochs per category: {epochs}")
+  print(f"Batch size: {batch_size}")
+  print(f"Learning rates - Head: {lr_head}, Backbone: {lr_backbone}")
+  
+  results = {}
+  detailed_logs = {}
+  
+  for category in component_mappings.keys():
+      if category in clip_models:
+          try:
+              result, training_log = train_category_model(category, clip_models[category], component_mappings)
+              results[category] = result
+              detailed_logs[category] = training_log
+              print(f"\n✅ Completed {category}: {result['best_val_acc']:.2f}% validation accuracy")
+          except Exception as e:
+              print(f"\n❌ Error training {category}: {e}")
+              results[category] = {
+                  "category": category,
+                  "status": "failed",
+                  "error": str(e),
+                  "best_val_acc": 0.0
+              }
+              detailed_logs[category] = {"category": category, "error": str(e)}
+      else:
+          print(f"\n⚠️  Model not found for category: {category}")
+          results[category] = {
+              "category": category,
+              "status": "skipped",
+              "error": "Model not found",
+              "best_val_acc": 0.0
+          }
+
+  # Save results summary
+  results_path = output_dir / "training_results.json"
+  with open(results_path, 'w') as f:
+      json.dump(results, f, indent=2)
+
+  # Save detailed logs
+  logs_path = output_dir / "training_logs.json"
+  with open(logs_path, 'w') as f:
+      json.dump(detailed_logs, f, indent=2)
+
+  # Create summary statistics
+  successful_results = [r for r in results.values() if r.get("status") == "completed"]
+  failed_results = [r for r in results.values() if r.get("status") == "failed"]
+  
+  summary = {
+      "training_summary": {
+          "total_categories": len(component_mappings),
+          "successful_categories": len(successful_results),
+          "failed_categories": len(failed_results),
+          "average_accuracy": np.mean([r["best_val_acc"] for r in successful_results]) if successful_results else 0,
+          "best_category": max(successful_results, key=lambda x: x["best_val_acc"])["category"] if successful_results else None,
+          "worst_category": min(successful_results, key=lambda x: x["best_val_acc"])["category"] if successful_results else None
+      },
+      "training_config": {
+          "epochs": epochs,
+          "batch_size": batch_size,
+          "lr_head": lr_head,
+          "lr_backbone": lr_backbone,
+          "weight_decay": weight_decay,
+          "early_stopping_patience": early_stopping_patience
+      },
+      "per_category_results": results
+  }
+  
+  # Save comprehensive summary
+  summary_path = output_dir / "phase2_summary.json"
+  with open(summary_path, 'w') as f:
+      json.dump(summary, f, indent=2)
+
+  print(f"\n" + "="*80)
+  print("PHASE 2 TRAINING COMPLETE")
+  print("="*80)
+  print(f"Successful categories: {len(successful_results)}/{len(component_mappings)}")
+  if successful_results:
+      print(f"Average accuracy: {summary['training_summary']['average_accuracy']:.2f}%")
+      print(f"Best performing category: {summary['training_summary']['best_category']}")
+      print(f"Results range: [{min(r['best_val_acc'] for r in successful_results):.2f}%, {max(r['best_val_acc'] for r in successful_results):.2f}%]")
+  
+  if failed_results:
+      print(f"Failed categories: {[r['category'] for r in failed_results]}")
+  
+  print(f"\nResults saved to:")
+  print(f"  - Summary: {results_path}")
+  print(f"  - Detailed logs: {logs_path}")
+  print(f"  - Full summary: {summary_path}")
+  print(f"  - Model checkpoints: {output_dir}/*_clip_best.pt")
+
+requirements:
+  - torch>=1.12.0
+  - torchvision>=0.13.0
+  - git+https://github.com/openai/CLIP.git
+  - pillow
+  - numpy
+
+tags:
+  - training
+  - clip
+  - computer-vision
+  - phase2
+  - component-classification
+  - mlops
+
+version: "1.0.0"

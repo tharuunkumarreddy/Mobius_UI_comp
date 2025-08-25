@@ -1,0 +1,328 @@
+name: phase1_model_definition
+display_name: Phase 1 Model Definition (ResNet50)
+description: Defines ResNet50-based model for category classification
+
+parameters:
+  label_mappings_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory containing label mappings
+  
+  dropout_rate:
+    type: float
+    default: 0.2
+    validation:
+      min: 0.0
+      max: 0.8
+    description: Dropout rate for classification head
+  
+  pretrained:
+    type: bool
+    default: true
+    description: Use pretrained ImageNet weights
+  
+  freeze_backbone:
+    type: bool
+    default: false
+    description: Freeze backbone weights during training
+  
+  model_variant:
+    type: str
+    default: "resnet50"
+    options: ["resnet50", "resnet101", "resnet152"]
+    description: ResNet variant to use
+  
+  custom_head_layers:
+    type: list
+    default: []
+    description: Additional hidden layers in classification head
+
+inputs:
+  label_mappings:
+    type: file
+    format: json
+    description: Category label mappings
+    path: "{label_mappings_dir}"
+
+outputs:
+  model:
+    type: object
+    description: Initialized ResNet model
+  
+  model_config:
+    type: dict
+    description: Model configuration parameters
+  
+  model_summary:
+    type: dict
+    description: Model architecture summary
+
+code: |
+  import torch
+  import torch.nn as nn
+  from torchvision.models import resnet50, resnet101, resnet152
+  from torchvision.models import ResNet50_Weights, ResNet101_Weights, ResNet152_Weights
+  import json
+  from pathlib import Path
+  
+  # Load label mappings to get number of categories
+  mappings_dir = Path(label_mappings_dir)
+  
+  try:
+      with open(mappings_dir / "category_to_idx.json") as f:
+          category_to_idx = json.load(f)
+      
+      with open(mappings_dir / "mapping_summary.json") as f:
+          mapping_summary = json.load(f)
+  except FileNotFoundError as e:
+      raise FileNotFoundError(f"Label mapping files not found in {mappings_dir}. Run label_mapping brick first.")
+  
+  num_categories = len(category_to_idx)
+  
+  def get_resnet_model_and_weights(variant, pretrained):
+      """Get ResNet model and weights based on variant"""
+      if variant == "resnet50":
+          weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+          return resnet50(weights=weights), 2048
+      elif variant == "resnet101":
+          weights = ResNet101_Weights.IMAGENET1K_V2 if pretrained else None
+          return resnet101(weights=weights), 2048
+      elif variant == "resnet152":
+          weights = ResNet152_Weights.IMAGENET1K_V2 if pretrained else None
+          return resnet152(weights=weights), 2048
+      else:
+          raise ValueError(f"Unsupported ResNet variant: {variant}")
+  
+  def create_custom_head(input_dim, output_dim, hidden_layers, dropout_rate):
+      """Create custom classification head with optional hidden layers"""
+      layers = []
+      
+      current_dim = input_dim
+      
+      # Add hidden layers if specified
+      for hidden_dim in hidden_layers:
+          layers.append(nn.Dropout(p=dropout_rate))
+          layers.append(nn.Linear(current_dim, hidden_dim))
+          layers.append(nn.ReLU(inplace=True))
+          layers.append(nn.BatchNorm1d(hidden_dim))
+          current_dim = hidden_dim
+      
+      # Final classification layer
+      layers.append(nn.Dropout(p=dropout_rate))
+      layers.append(nn.Linear(current_dim, output_dim))
+      
+      return nn.Sequential(*layers)
+  
+  class CategoryClassifier(nn.Module):
+      """ResNet-based category classifier for Phase 1"""
+      
+      def __init__(self, num_classes, model_variant="resnet50", dropout_rate=0.2, 
+                   pretrained=True, freeze_backbone=False, custom_head_layers=None):
+          super(CategoryClassifier, self).__init__()
+          
+          if custom_head_layers is None:
+              custom_head_layers = []
+          
+          # Load ResNet backbone
+          self.backbone, self.feature_dim = get_resnet_model_and_weights(model_variant, pretrained)
+          
+          # Create custom classification head
+          self.backbone.fc = create_custom_head(
+              self.feature_dim, num_classes, custom_head_layers, dropout_rate
+          )
+          
+          # Store configuration
+          self.num_classes = num_classes
+          self.dropout_rate = dropout_rate
+          self.pretrained = pretrained
+          self.freeze_backbone = freeze_backbone
+          self.model_variant = model_variant
+          self.custom_head_layers = custom_head_layers
+          
+          # Optionally freeze backbone
+          if freeze_backbone:
+              self._freeze_backbone()
+      
+      def _freeze_backbone(self):
+          """Freeze backbone parameters, keep classification head trainable"""
+          for name, param in self.backbone.named_parameters():
+              if 'fc' not in name:  # Don't freeze the classification head
+                  param.requires_grad = False
+          
+          # Ensure classification head is trainable
+          for param in self.backbone.fc.parameters():
+              param.requires_grad = True
+      
+      def forward(self, x):
+          return self.backbone(x)
+      
+      def get_features(self, x):
+          """Extract features before classification layer"""
+          x = self.backbone.conv1(x)
+          x = self.backbone.bn1(x)
+          x = self.backbone.relu(x)
+          x = self.backbone.maxpool(x)
+          
+          x = self.backbone.layer1(x)
+          x = self.backbone.layer2(x)
+          x = self.backbone.layer3(x)
+          x = self.backbone.layer4(x)
+          
+          x = self.backbone.avgpool(x)
+          x = torch.flatten(x, 1)
+          
+          return x
+      
+      def unfreeze_layers(self, layer_names):
+          """Unfreeze specific layers for fine-tuning"""
+          for name, param in self.backbone.named_parameters():
+              if any(layer_name in name for layer_name in layer_names):
+                  param.requires_grad = True
+      
+      def get_layer_names(self):
+          """Get all layer names for selective unfreezing"""
+          return [name for name, _ in self.backbone.named_parameters()]
+  
+  # Initialize model
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  
+  print(f"Initializing {model_variant} model for {num_categories} categories...")
+  print(f"Pretrained: {pretrained}, Freeze backbone: {freeze_backbone}")
+  print(f"Custom head layers: {custom_head_layers}")
+  
+  model = CategoryClassifier(
+      num_classes=num_categories,
+      model_variant=model_variant,
+      dropout_rate=dropout_rate,
+      pretrained=pretrained,
+      freeze_backbone=freeze_backbone,
+      custom_head_layers=custom_head_layers
+  )
+  
+  model.to(device)
+  
+  # Calculate parameter counts
+  total_params = sum(p.numel() for p in model.parameters())
+  trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+  frozen_params = total_params - trainable_params
+  
+  # Model configuration
+  model_config = {
+      "model_type": model_variant.upper(),
+      "num_categories": num_categories,
+      "categories": list(category_to_idx.keys()),
+      "dropout_rate": dropout_rate,
+      "pretrained": pretrained,
+      "freeze_backbone": freeze_backbone,
+      "custom_head_layers": custom_head_layers,
+      "feature_dim": model.feature_dim,
+      "device": str(device),
+      "total_params": total_params,
+      "trainable_params": trainable_params,
+      "frozen_params": frozen_params,
+      "category_to_idx": category_to_idx
+  }
+  
+  # Model architecture summary
+  def get_layer_info(module, prefix=""):
+      """Recursively get layer information"""
+      layers = []
+      for name, child in module.named_children():
+          full_name = f"{prefix}.{name}" if prefix else name
+          if len(list(child.children())) > 0:
+              layers.extend(get_layer_info(child, full_name))
+          else:
+              param_count = sum(p.numel() for p in child.parameters())
+              trainable_count = sum(p.numel() for p in child.parameters() if p.requires_grad)
+              layers.append({
+                  "name": full_name,
+                  "type": child.__class__.__name__,
+                  "params": param_count,
+                  "trainable_params": trainable_count
+              })
+      return layers
+  
+  layer_info = get_layer_info(model)
+  
+  model_summary = {
+      "architecture": model_variant,
+      "total_layers": len(layer_info),
+      "parameter_breakdown": {
+          "total": total_params,
+          "trainable": trainable_params,
+          "frozen": frozen_params,
+          "trainable_percentage": (trainable_params / total_params) * 100 if total_params > 0 else 0
+      },
+      "layer_details": layer_info[:10],  # First 10 layers for brevity
+      "classification_head": {
+          "input_dim": model.feature_dim,
+          "hidden_layers": custom_head_layers,
+          "output_dim": num_categories,
+          "dropout_rate": dropout_rate
+      },
+      "memory_estimate_mb": (total_params * 4) / (1024 * 1024),  # Assuming float32
+      "categories_mapping": category_to_idx
+  }
+  
+  # Print model summary
+  print("\n" + "="*50)
+  print("MODEL DEFINITION SUMMARY")
+  print("="*50)
+  print(f"Model: {model_variant.upper()}")
+  print(f"Device: {device}")
+  print(f"Categories: {num_categories}")
+  print(f"Total parameters: {total_params:,}")
+  print(f"Trainable parameters: {trainable_params:,} ({(trainable_params/total_params)*100:.1f}%)")
+  print(f"Frozen parameters: {frozen_params:,} ({(frozen_params/total_params)*100:.1f}%)")
+  print(f"Estimated memory: {(total_params * 4) / (1024 * 1024):.1f} MB")
+  
+  if freeze_backbone:
+      print("\n⚠️  Backbone frozen - only training classification head")
+  else:
+      print("\n✅ Full model training enabled")
+  
+  if custom_head_layers:
+      print(f"\n🔧 Custom head architecture: {model.feature_dim} → {' → '.join(map(str, custom_head_layers))} → {num_categories}")
+  else:
+      print(f"\n🔧 Standard head architecture: {model.feature_dim} → {num_categories}")
+  
+  # Test forward pass
+  try:
+      with torch.no_grad():
+          dummy_input = torch.randn(1, 3, 224, 224).to(device)
+          output = model(dummy_input)
+          features = model.get_features(dummy_input)
+          
+      print(f"\n✅ Forward pass successful:")
+      print(f"   Input shape: {dummy_input.shape}")
+      print(f"   Features shape: {features.shape}")
+      print(f"   Output shape: {output.shape}")
+      
+      # Update model summary with actual shapes
+      model_summary["forward_pass_validation"] = {
+          "input_shape": list(dummy_input.shape),
+          "features_shape": list(features.shape),
+          "output_shape": list(output.shape),
+          "success": True
+      }
+      
+  except Exception as e:
+      print(f"\n❌ Forward pass failed: {e}")
+      model_summary["forward_pass_validation"] = {
+          "success": False,
+          "error": str(e)
+      }
+
+requirements:
+  - torch>=1.12.0
+  - torchvision>=0.13.0
+
+tags:
+  - model-definition
+  - resnet
+  - computer-vision
+  - phase1
+  - category-classification
+  - mlops
+
+version: "1.0.0"

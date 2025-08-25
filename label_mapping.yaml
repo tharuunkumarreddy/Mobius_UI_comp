@@ -1,0 +1,254 @@
+name: label_mapping
+display_name: Label Mapping Generator
+description: Creates category and component label mappings from dataset structure
+
+parameters:
+  data_root:
+    type: str
+    default: "./dataset_split"
+    description: Root directory of split dataset
+  
+  output_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory to save label mapping files
+  
+  auto_discover:
+    type: bool
+    default: true
+    description: Automatically discover categories and components from dataset structure
+
+inputs:
+  split_dataset:
+    type: dataset
+    description: Dataset with train/val/test splits
+    path: "{data_root}"
+
+outputs:
+  category_mappings:
+    type: file
+    format: json
+    description: Category to index mappings
+    path: "{output_dir}/category_to_idx.json"
+  
+  idx_category_mappings:
+    type: file
+    format: json
+    description: Index to category mappings
+    path: "{output_dir}/idx_to_category.json"
+  
+  component_mappings:
+    type: file
+    format: json
+    description: Component to index mappings per category
+    path: "{output_dir}/component_mappings.json"
+  
+  mapping_summary:
+    type: file
+    format: json
+    description: Summary of all mappings
+    path: "{output_dir}/mapping_summary.json"
+
+code: |
+  import json
+  from pathlib import Path
+  from collections import defaultdict
+  
+  def list_category_paths(split_dir: Path):
+      """Get immediate subfolders inside train/ (these are categories)"""
+      if not split_dir.exists():
+          return []
+      return sorted([p for p in split_dir.iterdir() if p.is_dir()])
+  
+  def build_category_index(root: Path):
+      """
+      Returns:
+        categories: sorted list of unique category names
+      """
+      categories = []
+      for cat_dir in list_category_paths(root):
+          categories.append(cat_dir.name)
+      categories = sorted(set(categories))
+      return categories
+  
+  def discover_components_in_category(data_dir: Path, category: str, split: str = "train"):
+      """Automatically discover all component folders within a category."""
+      category_path = data_dir / split / category
+      if not category_path.exists():
+          print(f"Warning: Category path does not exist: {category_path}")
+          return []
+      
+      components = []
+      for item in category_path.iterdir():
+          if item.is_dir():
+              components.append(item.name)
+      
+      print(f"Found components in {category}: {components}")
+      return sorted(components)
+  
+  def get_all_components_mapping(data_dir: Path):
+      """Discover all components for each category from the dataset structure."""
+      components_mapping = {}
+      categories = build_category_index(data_dir / "train")
+      
+      for category in categories:
+          components = discover_components_in_category(data_dir, category, "train")
+          if components:
+              components_mapping[category] = components
+          else:
+              print(f"Warning: No components found for category {category}")
+      
+      return components_mapping
+  
+  def validate_mappings(data_dir: Path, categories: list, components_mapping: dict):
+      """Validate that all splits have consistent structure"""
+      validation_results = {
+          "missing_categories": defaultdict(list),
+          "missing_components": defaultdict(list),
+          "empty_folders": []
+      }
+      
+      for split in ["train", "val", "test"]:
+          split_dir = data_dir / split
+          if not split_dir.exists():
+              continue
+              
+          for category in categories:
+              cat_dir = split_dir / category
+              if not cat_dir.exists():
+                  validation_results["missing_categories"][split].append(category)
+                  continue
+                  
+              expected_components = components_mapping.get(category, [])
+              for component in expected_components:
+                  comp_dir = cat_dir / component
+                  if not comp_dir.exists():
+                      validation_results["missing_components"][split].append(f"{category}/{component}")
+                  elif not any(comp_dir.iterdir()):
+                      validation_results["empty_folders"].append(f"{split}/{category}/{component}")
+      
+      return validation_results
+  
+  # Setup paths
+  data_root = Path(data_root)
+  output_dir = Path(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  
+  print(f"Processing dataset at: {data_root}")
+  print(f"Output directory: {output_dir}")
+  
+  # Build category mappings from TRAIN split
+  train_root = data_root / "train"
+  if not train_root.exists():
+      raise FileNotFoundError(f"Training data not found at: {train_root}")
+  
+  categories = build_category_index(train_root)
+  if not categories:
+      raise ValueError("No categories found in the training dataset")
+  
+  category_to_idx = {c: i for i, c in enumerate(categories)}
+  idx_to_category = {i: c for c, i in category_to_idx.items()}
+  
+  print(f"Found {len(categories)} categories: {categories}")
+  
+  # Build component mappings
+  if auto_discover:
+      components_mapping = get_all_components_mapping(data_root)
+  else:
+      # Manual component mapping would go here
+      components_mapping = get_all_components_mapping(data_root)
+  
+  # Create component mappings for each category
+  component_mappings = {}
+  for category, components in components_mapping.items():
+      if not components:
+          print(f"Warning: No components found for category {category}")
+          continue
+          
+      component_to_idx = {comp: idx for idx, comp in enumerate(components)}
+      idx_to_component = {idx: comp for comp, idx in component_to_idx.items()}
+      
+      component_mappings[category] = {
+          "component_to_idx": component_to_idx,
+          "idx_to_component": idx_to_component,
+          "components": components,
+          "num_components": len(components)
+      }
+  
+  # Validate mappings across all splits
+  validation_results = validate_mappings(data_root, categories, components_mapping)
+  
+  # Save category mappings
+  with open(output_dir / "category_to_idx.json", "w") as f:
+      json.dump(category_to_idx, f, indent=2)
+  
+  with open(output_dir / "idx_to_category.json", "w") as f:
+      json.dump(idx_to_category, f, indent=2)
+  
+  # Save component mappings
+  with open(output_dir / "component_mappings.json", "w") as f:
+      json.dump(component_mappings, f, indent=2)
+  
+  # Save comprehensive summary
+  summary = {
+      "categories": categories,
+      "num_categories": len(categories),
+      "components_per_category": {cat: len(comps) for cat, comps in components_mapping.items()},
+      "total_components": sum(len(comps) for comps in components_mapping.values()),
+      "category_to_idx": category_to_idx,
+      "validation_results": {
+          "missing_categories_by_split": dict(validation_results["missing_categories"]),
+          "missing_components_by_split": dict(validation_results["missing_components"]),
+          "empty_folders": validation_results["empty_folders"]
+      },
+      "mapping_statistics": {
+          "min_components_per_category": min(len(comps) for comps in components_mapping.values()) if components_mapping else 0,
+          "max_components_per_category": max(len(comps) for comps in components_mapping.values()) if components_mapping else 0,
+          "avg_components_per_category": sum(len(comps) for comps in components_mapping.values()) / len(components_mapping) if components_mapping else 0
+      }
+  }
+  
+  with open(output_dir / "mapping_summary.json", "w") as f:
+      json.dump(summary, f, indent=2)
+  
+  # Print summary
+  print("\n" + "="*50)
+  print("LABEL MAPPING SUMMARY")
+  print("="*50)
+  print(f"Categories ({len(categories)}):")
+  for i, cat in enumerate(categories):
+      comp_count = len(components_mapping.get(cat, []))
+      print(f"  {i}: {cat} ({comp_count} components)")
+  
+  print(f"\nTotal components across all categories: {summary['total_components']}")
+  
+  # Print validation warnings
+  if validation_results["missing_categories"]:
+      print(f"\nWarning: Missing categories in some splits:")
+      for split, cats in validation_results["missing_categories"].items():
+          print(f"  {split}: {cats}")
+  
+  if validation_results["missing_components"]:
+      print(f"\nWarning: Missing components in some splits:")
+      for split, comps in validation_results["missing_components"].items():
+          print(f"  {split}: {comps[:5]}{'...' if len(comps) > 5 else ''}")
+  
+  if validation_results["empty_folders"]:
+      print(f"\nWarning: Empty folders found:")
+      for folder in validation_results["empty_folders"][:10]:
+          print(f"  {folder}")
+      if len(validation_results["empty_folders"]) > 10:
+          print(f"  ... and {len(validation_results['empty_folders']) - 10} more")
+  
+  print(f"\nLabel mappings saved to: {output_dir}")
+
+requirements:
+  - pathlib
+
+tags:
+  - label-mapping
+  - data-preprocessing
+  - computer-vision
+  - mlops
+
+version: "1.0.0"

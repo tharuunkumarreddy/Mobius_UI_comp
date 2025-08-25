@@ -1,0 +1,911 @@
+name: evaluation
+display_name: Model Evaluation
+description: Evaluates trained models on test set and generates comprehensive metrics
+
+parameters:
+  phase1_model_dir:
+    type: str
+    default: "./phase1_resnet50"
+    description: Directory containing Phase 1 model
+  
+  phase2_model_dir:
+    type: str
+    default: "./phase2_clip_models"
+    description: Directory containing Phase 2 models
+  
+  data_root:
+    type: str
+    default: "./dataset_split"
+    description: Root directory of split dataset
+  
+  label_mappings_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory containing label mappings
+  
+  output_dir:
+    type: str
+    default: "./evaluation_results"
+    description: Directory to save evaluation results
+  
+  batch_size:
+    type: int
+    default: 32
+    validation:
+      min: 1
+      max: 128
+    description: Batch size for evaluation
+  
+  evaluate_phase1:
+    type: bool
+    default: true
+    description: Evaluate Phase 1 category classification
+  
+  evaluate_phase2:
+    type: bool
+    default: true
+    description: Evaluate Phase 2 component classification
+  
+  evaluate_end_to_end:
+    type: bool
+    default: true
+    description: Evaluate end-to-end pipeline
+  
+  generate_visualizations:
+    type: bool
+    default: true
+    description: Generate evaluation visualizations
+
+inputs:
+  phase1_trained_model:
+    type: file
+    format: pt
+    description: Trained Phase 1 model
+    path: "{phase1_model_dir}/phase1_best.pt"
+  
+  phase2_trained_models:
+    type: dict
+    description: Dictionary of trained Phase 2 models
+    path: "{phase2_model_dir}"
+  
+  test_dataset:
+    type: dataset
+    description: Test dataset for evaluation
+    path: "{data_root}/test"
+  
+  label_mappings:
+    type: file
+    format: json
+    description: Label mappings
+    path: "{label_mappings_dir}"
+
+outputs:
+  evaluation_report:
+    type: file
+    format: json
+    description: Comprehensive evaluation report
+    path: "{output_dir}/evaluation_report.json"
+  
+  confusion_matrices:
+    type: file
+    format: json
+    description: Confusion matrices for all models
+    path: "{output_dir}/confusion_matrices.json"
+  
+  performance_metrics:
+    type: file
+    format: json
+    description: Detailed performance metrics
+    path: "{output_dir}/performance_metrics.json"
+  
+  evaluation_plots:
+    type: file
+    format: png
+    description: Evaluation visualizations
+    path: "{output_dir}/evaluation_plots.png"
+
+code: |
+  import json
+  import time
+  import numpy as np
+  from pathlib import Path
+  from collections import defaultdict, Counter
+  import torch
+  import torch.nn.functional as F
+  from torch.utils.data import DataLoader
+  from sklearn.metrics import (
+      classification_report, confusion_matrix, accuracy_score,
+      precision_recall_fscore_support, top_k_accuracy_score
+  )
+  
+  # Optional imports for visualizations
+  try:
+      import matplotlib.pyplot as plt
+      import seaborn as sns
+      PLOTTING_AVAILABLE = True
+  except ImportError:
+      PLOTTING_AVAILABLE = False
+      print("Warning: matplotlib/seaborn not available. Skipping visualizations.")
+  
+  # Install CLIP if needed
+  try:
+      import clip
+  except ImportError:
+      import subprocess
+      import sys
+      print("Installing CLIP...")
+      subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/openai/CLIP.git"])
+      import clip
+  
+  # Setup paths
+  phase1_dir = Path(phase1_model_dir)
+  phase2_dir = Path(phase2_model_dir)
+  data_dir = Path(data_root)
+  mappings_dir = Path(label_mappings_dir)
+  output_dir = Path(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  
+  print(f"Starting comprehensive evaluation on device: {device}")
+  print(f"Batch size: {batch_size}")
+  
+  # Load label mappings
+  try:
+      with open(mappings_dir / "category_to_idx.json") as f:
+          category_to_idx = json.load(f)
+      with open(mappings_dir / "idx_to_category.json") as f:
+          idx_to_category = {int(k): v for k, v in json.load(f).items()}
+      with open(mappings_dir / "component_mappings.json") as f:
+          component_mappings = json.load(f)
+      with open(mappings_dir / "mapping_summary.json") as f:
+          mapping_summary = json.load(f)
+  except FileNotFoundError as e:
+      raise FileNotFoundError(f"Label mapping files not found. Run label_mapping brick first.")
+  
+  # Import the inference pipeline classes
+  from inference_pipeline import CategoryClassifier, ComponentClassifier, UIComponentPredictor
+  
+  class EvaluationMetrics:
+      """Utility class for calculating evaluation metrics"""
+      
+      @staticmethod
+      def calculate_metrics(y_true, y_pred, target_names=None):
+          """Calculate comprehensive classification metrics"""
+          metrics = {
+              "accuracy": accuracy_score(y_true, y_pred),
+              "macro_precision": precision_recall_fscore_support(y_true, y_pred, average='macro')[0],
+              "macro_recall": precision_recall_fscore_support(y_true, y_pred, average='macro')[1],
+              "macro_f1": precision_recall_fscore_support(y_true, y_pred, average='macro')[2],
+              "weighted_precision": precision_recall_fscore_support(y_true, y_pred, average='weighted')[0],
+              "weighted_recall": precision_recall_fscore_support(y_true, y_pred, average='weighted')[1],
+              "weighted_f1": precision_recall_fscore_support(y_true, y_pred, average='weighted')[2]
+          }
+          
+          if target_names:
+              # Per-class metrics
+              report = classification_report(y_true, y_pred, target_names=target_names, output_dict=True)
+              metrics["per_class_metrics"] = report
+          
+          return metrics
+      
+      @staticmethod
+      def calculate_confusion_matrix(y_true, y_pred, labels=None):
+          """Calculate confusion matrix"""
+          cm = confusion_matrix(y_true, y_pred, labels=labels)
+          
+          # Normalize confusion matrix
+          cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+          cm_normalized = np.nan_to_num(cm_normalized)  # Handle division by zero
+          
+          return {
+              "confusion_matrix": cm.tolist(),
+              "confusion_matrix_normalized": cm_normalized.tolist()
+          }
+      
+      @staticmethod
+      def calculate_top_k_accuracy(y_true, y_prob, k_values=[1, 3, 5]):
+          """Calculate top-k accuracy"""
+          top_k_metrics = {}
+          for k in k_values:
+              if k <= y_prob.shape[1]:  # Ensure k doesn't exceed number of classes
+                  top_k_acc = top_k_accuracy_score(y_true, y_prob, k=k)
+                  top_k_metrics[f"top_{k}_accuracy"] = top_k_acc
+          return top_k_metrics
+  
+  def evaluate_phase1(category_classifier, test_loader):
+      """Evaluate Phase 1 category classification"""
+      print("\n" + "="*50)
+      print("EVALUATING PHASE 1: CATEGORY CLASSIFICATION")
+      print("="*50)
+      
+      all_preds = []
+      all_targets = []
+      all_probs = []
+      inference_times = []
+      
+      category_classifier.model.eval()
+      
+      with torch.no_grad():
+          for batch_idx, (images, targets) in enumerate(test_loader):
+              start_time = time.time()
+              
+              images = images.to(device)
+              logits = category_classifier.model(images)
+              probs = F.softmax(logits, dim=-1)
+              
+              inference_time = time.time() - start_time
+              inference_times.extend([inference_time / len(targets)] * len(targets))
+              
+              preds = probs.argmax(dim=1).cpu().numpy()
+              all_preds.extend(preds)
+              all_targets.extend(targets.numpy())
+              all_probs.extend(probs.cpu().numpy())
+              
+              if (batch_idx + 1) % 10 == 0:
+                  print(f"  Processed {(batch_idx + 1) * batch_size} samples...")
+      
+      all_probs = np.array(all_probs)
+      
+      # Calculate metrics
+      target_names = [idx_to_category[i] for i in range(len(category_to_idx))]
+      metrics = EvaluationMetrics.calculate_metrics(all_targets, all_preds, target_names)
+      confusion_data = EvaluationMetrics.calculate_confusion_matrix(all_targets, all_preds)
+      top_k_metrics = EvaluationMetrics.calculate_top_k_accuracy(all_targets, all_probs)
+      
+      # Performance metrics
+      performance = {
+          "average_inference_time": np.mean(inference_times),
+          "total_samples": len(all_targets),
+          "throughput": len(all_targets) / sum(inference_times)
+      }
+      
+      results = {
+          "phase": "phase1_category_classification",
+          "metrics": metrics,
+          "confusion_matrix": confusion_data,
+          "top_k_accuracy": top_k_metrics,
+          "performance": performance,
+          "predictions": all_preds,
+          "targets": all_targets,
+          "probabilities": all_probs.tolist(),
+          "category_names": target_names
+      }
+      
+      print(f"✅ Phase 1 Evaluation Complete:")
+      print(f"   Accuracy: {metrics['accuracy']:.3f}")
+      print(f"   Macro F1: {metrics['macro_f1']:.3f}")
+      print(f"   Weighted F1: {metrics['weighted_f1']:.3f}")
+      print(f"   Average inference time: {performance['average_inference_time']:.4f}s")
+      
+      return results
+  
+  def evaluate_phase2_category(component_classifier, category, test_dataset_path):
+      """Evaluate Phase 2 component classification for a specific category"""
+      print(f"\n  Evaluating category: {category}")
+      
+      try:
+          # Create category-specific test dataset
+          from torch.utils.data import Dataset
+          from PIL import Image
+          from torchvision import transforms
+          
+          class CategoryTestDataset(Dataset):
+              def __init__(self, root, category, component_mappings, transform=None):
+                  self.transform = transform
+                  self.samples = []
+                  self.component_to_idx = component_mappings[category]["component_to_idx"]
+                  
+                  category_folder = Path(root) / "test" / category
+                  if not category_folder.exists():
+                      return
+                  
+                  IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+                  for component in component_mappings[category]["components"]:
+                      component_dir = category_folder / component
+                      if component_dir.exists():
+                          for img_path in component_dir.iterdir():
+                              if img_path.suffix.lower() in IMG_EXTS:
+                                  self.samples.append((img_path, self.component_to_idx[component]))
+              
+              def __len__(self):
+                  return len(self.samples)
+              
+              def __getitem__(self, idx):
+                  img_path, label = self.samples[idx]
+                  img = Image.open(img_path).convert("RGB")
+                  if self.transform:
+                      img = self.transform(img)
+                  return img, label
+          
+          # CLIP preprocessing
+          clip_transform = transforms.Compose([
+              transforms.Resize((224, 224)),
+              transforms.ToTensor(),
+              transforms.Normalize(
+                  mean=[0.48145466, 0.4578275, 0.40821073],
+                  std=[0.26862954, 0.26130258, 0.27577711]
+              )
+          ])
+          
+          test_ds = CategoryTestDataset(
+              test_dataset_path.parent, 
+              category, 
+              component_mappings, 
+              clip_transform
+          )
+          
+          if len(test_ds) == 0:
+              print(f"    No test samples found for category: {category}")
+              return None
+          
+          test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+          
+          # Get the model for this category
+          model_info = component_classifier._load_model_for_category(category)
+          
+          all_preds = []
+          all_targets = []
+          all_probs = []
+          inference_times = []
+          
+          with torch.no_grad():
+              for images, targets in test_loader:
+                  start_time = time.time()
+                  
+                  images = images.to(device)
+                  
+                  # Extract CLIP features
+                  features = model_info['clip_model'].encode_image(images)
+                  features = features / features.norm(dim=-1, keepdim=True)
+                  features = features.float()
+                  
+                  # Classify with head
+                  logits = model_info['head'](features)
+                  probs = F.softmax(logits, dim=-1)
+                  
+                  inference_time = time.time() - start_time
+                  inference_times.extend([inference_time / len(targets)] * len(targets))
+                  
+                  preds = probs.argmax(dim=1).cpu().numpy()
+                  all_preds.extend(preds)
+                  all_targets.extend(targets.numpy())
+                  all_probs.extend(probs.cpu().numpy())
+          
+          all_probs = np.array(all_probs)
+          
+          # Calculate metrics
+          target_names = [model_info['idx_to_component'][i] 
+                         for i in range(len(component_mappings[category]["components"]))]
+          
+          metrics = EvaluationMetrics.calculate_metrics(all_targets, all_preds, target_names)
+          confusion_data = EvaluationMetrics.calculate_confusion_matrix(all_targets, all_preds)
+          top_k_metrics = EvaluationMetrics.calculate_top_k_accuracy(all_targets, all_probs)
+          
+          performance = {
+              "average_inference_time": np.mean(inference_times),
+              "total_samples": len(all_targets),
+              "throughput": len(all_targets) / sum(inference_times)
+          }
+          
+          result = {
+              "category": category,
+              "metrics": metrics,
+              "confusion_matrix": confusion_data,
+              "top_k_accuracy": top_k_metrics,
+              "performance": performance,
+              "num_test_samples": len(test_ds),
+              "num_components": len(component_mappings[category]["components"]),
+              "component_names": target_names
+          }
+          
+          print(f"    ✅ {category}: {metrics['accuracy']:.3f} accuracy on {len(test_ds)} samples")
+          return result
+          
+      except Exception as e:
+          print(f"    ❌ Error evaluating category {category}: {e}")
+          return {
+              "category": category,
+              "error": str(e),
+              "num_test_samples": 0
+          }
+  
+  def evaluate_phase2(component_classifier, test_dataset_path):
+      """Evaluate Phase 2 component classification for all categories"""
+      print("\n" + "="*50)
+      print("EVALUATING PHASE 2: COMPONENT CLASSIFICATION")
+      print("="*50)
+      
+      results = {}
+      
+      for category in component_mappings.keys():
+          result = evaluate_phase2_category(component_classifier, category, test_dataset_path)
+          if result:
+              results[category] = result
+      
+      # Calculate overall Phase 2 metrics
+      successful_categories = [r for r in results.values() if 'metrics' in r]
+      
+      if successful_categories:
+          overall_metrics = {
+              "categories_evaluated": len(successful_categories),
+              "total_categories": len(component_mappings),
+              "average_accuracy": np.mean([r['metrics']['accuracy'] for r in successful_categories]),
+              "average_macro_f1": np.mean([r['metrics']['macro_f1'] for r in successful_categories]),
+              "average_weighted_f1": np.mean([r['metrics']['weighted_f1'] for r in successful_categories]),
+              "total_test_samples": sum([r['num_test_samples'] for r in successful_categories]),
+              "average_inference_time": np.mean([r['performance']['average_inference_time'] for r in successful_categories])
+          }
+          
+          print(f"\n✅ Phase 2 Overall Results:")
+          print(f"   Categories evaluated: {overall_metrics['categories_evaluated']}/{overall_metrics['total_categories']}")
+          print(f"   Average accuracy: {overall_metrics['average_accuracy']:.3f}")
+          print(f"   Average macro F1: {overall_metrics['average_macro_f1']:.3f}")
+          print(f"   Total test samples: {overall_metrics['total_test_samples']}")
+          
+          return {
+              "phase": "phase2_component_classification",
+              "overall_metrics": overall_metrics,
+              "per_category_results": results
+          }
+      else:
+          return {
+              "phase": "phase2_component_classification",
+              "error": "No categories could be evaluated",
+              "per_category_results": results
+          }
+  
+  def evaluate_end_to_end(predictor, test_dataset_path):
+      """Evaluate end-to-end pipeline performance"""
+      print("\n" + "="*50)
+      print("EVALUATING END-TO-END PIPELINE")
+      print("="*50)
+      
+      # Collect all test images with ground truth labels
+      test_images = []
+      ground_truth = []
+      
+      IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+      
+      for category in component_mappings.keys():
+          category_folder = test_dataset_path / category
+          if not category_folder.exists():
+              continue
+              
+          for component in component_mappings[category]["components"]:
+              component_folder = category_folder / component
+              if not component_folder.exists():
+                  continue
+                  
+              for img_path in component_folder.iterdir():
+                  if img_path.suffix.lower() in IMG_EXTS:
+                      test_images.append(str(img_path))
+                      ground_truth.append(f"{category}/{component}")
+      
+      if not test_images:
+          return {
+              "phase": "end_to_end_pipeline",
+              "error": "No test images found"
+          }
+      
+      print(f"Found {len(test_images)} test images across all categories")
+      
+      # Run end-to-end prediction
+      start_time = time.time()
+      predictions = []
+      
+      # Process in batches for efficiency
+      batch_size_e2e = 50
+      for i in range(0, len(test_images), batch_size_e2e):
+          batch_images = test_images[i:i + batch_size_e2e]
+          batch_results = predictor.predict_batch(batch_images)
+          predictions.extend(batch_results)
+          
+          if (i // batch_size_e2e + 1) % 10 == 0:
+              print(f"  Processed {min(i + batch_size_e2e, len(test_images))}/{len(test_images)} images...")
+      
+      total_time = time.time() - start_time
+      
+      # Analyze results
+      successful_predictions = [p for p in predictions if p.get('success', False)]
+      failed_predictions = [p for p in predictions if not p.get('success', False)]
+      
+      # Calculate accuracy metrics
+      predicted_labels = []
+      true_labels = []
+      category_correct = 0
+      component_correct = 0
+      
+      for i, pred in enumerate(predictions):
+          true_label = ground_truth[i]
+          true_category, true_component = true_label.split('/')
+          
+          if pred.get('success', False):
+              pred_category = pred.get('predicted_category', '')
+              pred_component = pred.get('predicted_component', '')
+              pred_label = f"{pred_category}/{pred_component}"
+              
+              predicted_labels.append(pred_label)
+              true_labels.append(true_label)
+              
+              # Category accuracy
+              if pred_category == true_category:
+                  category_correct += 1
+              
+              # Full component accuracy
+              if pred_label == true_label:
+                  component_correct += 1
+          else:
+              predicted_labels.append("FAILED")
+              true_labels.append(true_label)
+      
+      # Calculate metrics
+      end_to_end_metrics = {
+          "total_images": len(test_images),
+          "successful_predictions": len(successful_predictions),
+          "failed_predictions": len(failed_predictions),
+          "success_rate": len(successful_predictions) / len(test_images),
+          "category_accuracy": category_correct / len(test_images),
+          "component_accuracy": component_correct / len(test_images),
+          "total_inference_time": total_time,
+          "average_time_per_image": total_time / len(test_images),
+          "throughput": len(test_images) / total_time
+      }
+      
+      # Error analysis
+      error_analysis = {
+          "error_types": Counter([p.get('error_type', 'Unknown') for p in failed_predictions]),
+          "category_errors": defaultdict(int),
+          "component_errors": defaultdict(int)
+      }
+      
+      for i, pred in enumerate(predictions):
+          if pred.get('success', False):
+              true_label = ground_truth[i]
+              true_category, true_component = true_label.split('/')
+              pred_category = pred.get('predicted_category', '')
+              pred_component = pred.get('predicted_component', '')
+              
+              if pred_category != true_category:
+                  error_analysis['category_errors'][f"{true_category}->{pred_category}"] += 1
+              
+              if pred_component != true_component and pred_category == true_category:
+                  error_analysis['component_errors'][f"{true_category}/{true_component}->{pred_component}"] += 1
+      
+      # Convert defaultdicts to regular dicts for JSON serialization
+      error_analysis['category_errors'] = dict(error_analysis['category_errors'])
+      error_analysis['component_errors'] = dict(error_analysis['component_errors'])
+      
+      print(f"\n✅ End-to-End Evaluation Complete:")
+      print(f"   Success rate: {end_to_end_metrics['success_rate']:.3f}")
+      print(f"   Category accuracy: {end_to_end_metrics['category_accuracy']:.3f}")
+      print(f"   Component accuracy: {end_to_end_metrics['component_accuracy']:.3f}")
+      print(f"   Average time per image: {end_to_end_metrics['average_time_per_image']:.4f}s")
+      print(f"   Throughput: {end_to_end_metrics['throughput']:.1f} images/sec")
+      
+      return {
+          "phase": "end_to_end_pipeline",
+          "metrics": end_to_end_metrics,
+          "error_analysis": error_analysis,
+          "predictions": predictions,
+          "ground_truth": ground_truth
+      }
+  
+  def generate_visualizations(evaluation_results, output_dir):
+      """Generate evaluation visualizations"""
+      if not PLOTTING_AVAILABLE or not generate_visualizations:
+          return
+      
+      print("\n" + "="*50)
+      print("GENERATING VISUALIZATIONS")
+      print("="*50)
+      
+      try:
+          fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+          fig.suptitle('Model Evaluation Results', fontsize=16, fontweight='bold')
+          
+          # Phase 1 Confusion Matrix
+          if 'phase1_results' in evaluation_results and 'confusion_matrix' in evaluation_results['phase1_results']:
+              cm = np.array(evaluation_results['phase1_results']['confusion_matrix']['confusion_matrix_normalized'])
+              categories = evaluation_results['phase1_results']['category_names']
+              
+              sns.heatmap(cm, annot=True, fmt='.2f', cmap='Blues', 
+                         xticklabels=categories, yticklabels=categories, ax=axes[0, 0])
+              axes[0, 0].set_title('Phase 1: Category Classification\nNormalized Confusion Matrix')
+              axes[0, 0].set_xlabel('Predicted')
+              axes[0, 0].set_ylabel('Actual')
+          
+          # Phase 1 Accuracy by Category
+          if 'phase1_results' in evaluation_results:
+              per_class = evaluation_results['phase1_results']['metrics'].get('per_class_metrics', {})
+              if per_class:
+                  categories = [cat for cat in per_class.keys() if cat not in ['accuracy', 'macro avg', 'weighted avg']]
+                  accuracies = [per_class[cat]['f1-score'] for cat in categories if cat in per_class]
+                  
+                  axes[0, 1].bar(range(len(categories)), accuracies)
+                  axes[0, 1].set_title('Phase 1: F1-Score by Category')
+                  axes[0, 1].set_xlabel('Categories')
+                  axes[0, 1].set_ylabel('F1-Score')
+                  axes[0, 1].set_xticks(range(len(categories)))
+                  axes[0, 1].set_xticklabels(categories, rotation=45, ha='right')
+          
+          # Phase 2 Accuracy Distribution
+          if 'phase2_results' in evaluation_results and 'per_category_results' in evaluation_results['phase2_results']:
+              phase2_results = evaluation_results['phase2_results']['per_category_results']
+              valid_results = {k: v for k, v in phase2_results.items() if 'metrics' in v}
+              
+              if valid_results:
+                  categories = list(valid_results.keys())
+                  accuracies = [valid_results[cat]['metrics']['accuracy'] for cat in categories]
+                  
+                  axes[0, 2].bar(range(len(categories)), accuracies)
+                  axes[0, 2].set_title('Phase 2: Accuracy by Category')
+                  axes[0, 2].set_xlabel('Categories')
+                  axes[0, 2].set_ylabel('Accuracy')
+                  axes[0, 2].set_xticks(range(len(categories)))
+                  axes[0, 2].set_xticklabels(categories, rotation=45, ha='right')
+          
+          # End-to-End Performance Metrics
+          if 'end_to_end_results' in evaluation_results and 'metrics' in evaluation_results['end_to_end_results']:
+              e2e_metrics = evaluation_results['end_to_end_results']['metrics']
+              
+              metrics_names = ['Success Rate', 'Category Acc', 'Component Acc']
+              metrics_values = [
+                  e2e_metrics.get('success_rate', 0),
+                  e2e_metrics.get('category_accuracy', 0),
+                  e2e_metrics.get('component_accuracy', 0)
+              ]
+              
+              bars = axes[1, 0].bar(metrics_names, metrics_values, 
+                                   color=['green', 'blue', 'orange'])
+              axes[1, 0].set_title('End-to-End Pipeline Performance')
+              axes[1, 0].set_ylabel('Score')
+              axes[1, 0].set_ylim(0, 1)
+              
+              # Add value labels on bars
+              for bar, value in zip(bars, metrics_values):
+                  height = bar.get_height()
+                  axes[1, 0].text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                                 f'{value:.3f}', ha='center', va='bottom')
+          
+          # Processing Time Comparison
+          processing_times = []
+          phase_names = []
+          
+          if 'phase1_results' in evaluation_results and 'performance' in evaluation_results['phase1_results']:
+              processing_times.append(evaluation_results['phase1_results']['performance']['average_inference_time'])
+              phase_names.append('Phase 1')
+          
+          if 'phase2_results' in evaluation_results and 'overall_metrics' in evaluation_results['phase2_results']:
+              processing_times.append(evaluation_results['phase2_results']['overall_metrics']['average_inference_time'])
+              phase_names.append('Phase 2')
+          
+          if 'end_to_end_results' in evaluation_results and 'metrics' in evaluation_results['end_to_end_results']:
+              processing_times.append(evaluation_results['end_to_end_results']['metrics']['average_time_per_image'])
+              phase_names.append('End-to-End')
+          
+          if processing_times:
+              axes[1, 1].bar(phase_names, processing_times, color=['skyblue', 'lightcoral', 'lightgreen'])
+              axes[1, 1].set_title('Average Processing Time per Image')
+              axes[1, 1].set_ylabel('Time (seconds)')
+              
+              # Add value labels
+              for i, (name, time_val) in enumerate(zip(phase_names, processing_times)):
+                  axes[1, 1].text(i, time_val + max(processing_times) * 0.01,
+                                 f'{time_val:.4f}s', ha='center', va='bottom')
+          
+          # Model Performance Summary
+          summary_data = []
+          if 'phase1_results' in evaluation_results:
+              summary_data.append(['Phase 1', 
+                                 f"{evaluation_results['phase1_results']['metrics']['accuracy']:.3f}",
+                                 f"{evaluation_results['phase1_results']['metrics']['macro_f1']:.3f}"])
+          
+          if 'phase2_results' in evaluation_results and 'overall_metrics' in evaluation_results['phase2_results']:
+              summary_data.append(['Phase 2', 
+                                 f"{evaluation_results['phase2_results']['overall_metrics']['average_accuracy']:.3f}",
+                                 f"{evaluation_results['phase2_results']['overall_metrics']['average_macro_f1']:.3f}"])
+          
+          if 'end_to_end_results' in evaluation_results and 'metrics' in evaluation_results['end_to_end_results']:
+              summary_data.append(['End-to-End', 
+                                 f"{evaluation_results['end_to_end_results']['metrics']['component_accuracy']:.3f}",
+                                 "N/A"])
+          
+          if summary_data:
+              axes[1, 2].axis('tight')
+              axes[1, 2].axis('off')
+              table = axes[1, 2].table(cellText=summary_data,
+                                      colLabels=['Phase', 'Accuracy', 'Macro F1'],
+                                      cellLoc='center',
+                                      loc='center')
+              table.auto_set_font_size(False)
+              table.set_fontsize(10)
+              table.scale(1, 2)
+              axes[1, 2].set_title('Performance Summary')
+          
+          plt.tight_layout()
+          plt.savefig(output_dir / 'evaluation_plots.png', dpi=300, bbox_inches='tight')
+          plt.close()
+          
+          print("✅ Visualizations saved to evaluation_plots.png")
+          
+      except Exception as e:
+          print(f"❌ Error generating visualizations: {e}")
+  
+  # Main evaluation execution
+  evaluation_results = {
+      "evaluation_timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+      "evaluation_config": {
+          "batch_size": batch_size,
+          "evaluate_phase1": evaluate_phase1,
+          "evaluate_phase2": evaluate_phase2,
+          "evaluate_end_to_end": evaluate_end_to_end,
+          "device": str(device)
+      },
+      "dataset_info": {
+          "categories": len(category_to_idx),
+          "total_components": sum(len(comp_data['components']) for comp_data in component_mappings.values()),
+          "test_data_path": str(data_dir / "test")
+      }
+  }
+  
+  # Phase 1 Evaluation
+  if evaluate_phase1:
+      try:
+          # Create test dataset and loader for Phase 1
+          from torch.utils.data import Dataset
+          from PIL import Image
+          from torchvision import transforms
+          
+          class TestDataset(Dataset):
+              def __init__(self, root, category_to_idx, transform=None):
+                  self.transform = transform
+                  self.samples = []
+                  self.category_to_idx = category_to_idx
+                  
+                  test_root = Path(root) / "test"
+                  IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+                  
+                  for cat in sorted(category_to_idx.keys()):
+                      cat_dir = test_root / cat
+                      if not cat_dir.exists():
+                          continue
+                      for comp_dir in cat_dir.iterdir():
+                          if comp_dir.is_dir():
+                              for img_path in comp_dir.iterdir():
+                                  if img_path.suffix.lower() in IMG_EXTS:
+                                      self.samples.append((img_path, category_to_idx[cat]))
+              
+              def __len__(self):
+                  return len(self.samples)
+              
+              def __getitem__(self, idx):
+                  img_path, label = self.samples[idx]
+                  img = Image.open(img_path).convert("RGB")
+                  if self.transform:
+                      img = self.transform(img)
+                  return img, label
+          
+          # Create Phase 1 classifier and test dataset
+          category_classifier = CategoryClassifier(phase1_dir)
+          
+          test_dataset = TestDataset(data_dir, category_to_idx, category_classifier.transform)
+          test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+          
+          print(f"Phase 1 test dataset: {len(test_dataset)} samples")
+          
+          phase1_results = evaluate_phase1(category_classifier, test_loader)
+          evaluation_results["phase1_results"] = phase1_results
+          
+      except Exception as e:
+          print(f"❌ Phase 1 evaluation failed: {e}")
+          evaluation_results["phase1_results"] = {"error": str(e)}
+  
+  # Phase 2 Evaluation
+  if evaluate_phase2:
+      try:
+          component_classifier = ComponentClassifier(phase2_dir)
+          phase2_results = evaluate_phase2(component_classifier, data_dir / "test")
+          evaluation_results["phase2_results"] = phase2_results
+          
+      except Exception as e:
+          print(f"❌ Phase 2 evaluation failed: {e}")
+          evaluation_results["phase2_results"] = {"error": str(e)}
+  
+  # End-to-End Evaluation
+  if evaluate_end_to_end:
+      try:
+          predictor = UIComponentPredictor(phase1_dir, phase2_dir, verbose=False)
+          end_to_end_results = evaluate_end_to_end(predictor, data_dir / "test")
+          evaluation_results["end_to_end_results"] = end_to_end_results
+          
+      except Exception as e:
+          print(f"❌ End-to-end evaluation failed: {e}")
+          evaluation_results["end_to_end_results"] = {"error": str(e)}
+  
+  # Extract confusion matrices for separate file
+  confusion_matrices = {}
+  if "phase1_results" in evaluation_results and "confusion_matrix" in evaluation_results["phase1_results"]:
+      confusion_matrices["phase1"] = evaluation_results["phase1_results"]["confusion_matrix"]
+  
+  if "phase2_results" in evaluation_results and "per_category_results" in evaluation_results["phase2_results"]:
+      confusion_matrices["phase2"] = {}
+      for cat, result in evaluation_results["phase2_results"]["per_category_results"].items():
+          if "confusion_matrix" in result:
+              confusion_matrices["phase2"][cat] = result["confusion_matrix"]
+  
+  # Save results
+  with open(output_dir / "evaluation_report.json", 'w') as f:
+      json.dump(evaluation_results, f, indent=2)
+  
+  with open(output_dir / "confusion_matrices.json", 'w') as f:
+      json.dump(confusion_matrices, f, indent=2)
+  
+  # Extract detailed performance metrics
+  performance_metrics = {
+      "summary": {},
+      "detailed_metrics": {}
+  }
+  
+  if "phase1_results" in evaluation_results:
+      performance_metrics["summary"]["phase1_accuracy"] = evaluation_results["phase1_results"].get("metrics", {}).get("accuracy", 0)
+      performance_metrics["detailed_metrics"]["phase1"] = evaluation_results["phase1_results"]
+  
+  if "phase2_results" in evaluation_results:
+      phase2_overall = evaluation_results["phase2_results"].get("overall_metrics", {})
+      performance_metrics["summary"]["phase2_avg_accuracy"] = phase2_overall.get("average_accuracy", 0)
+      performance_metrics["detailed_metrics"]["phase2"] = evaluation_results["phase2_results"]
+  
+  if "end_to_end_results" in evaluation_results:
+      e2e_metrics = evaluation_results["end_to_end_results"].get("metrics", {})
+      performance_metrics["summary"]["end_to_end_component_accuracy"] = e2e_metrics.get("component_accuracy", 0)
+      performance_metrics["summary"]["end_to_end_success_rate"] = e2e_metrics.get("success_rate", 0)
+      performance_metrics["detailed_metrics"]["end_to_end"] = evaluation_results["end_to_end_results"]
+  
+  with open(output_dir / "performance_metrics.json", 'w') as f:
+      json.dump(performance_metrics, f, indent=2)
+  
+  # Generate visualizations
+  generate_visualizations(evaluation_results, output_dir)
+  
+  print(f"\n" + "="*60)
+  print("EVALUATION COMPLETE")
+  print("="*60)
+  
+  if "phase1_results" in evaluation_results and "metrics" in evaluation_results["phase1_results"]:
+      print(f"Phase 1 Accuracy: {evaluation_results['phase1_results']['metrics']['accuracy']:.3f}")
+  
+  if "phase2_results" in evaluation_results and "overall_metrics" in evaluation_results["phase2_results"]:
+      print(f"Phase 2 Average Accuracy: {evaluation_results['phase2_results']['overall_metrics']['average_accuracy']:.3f}")
+  
+  if "end_to_end_results" in evaluation_results and "metrics" in evaluation_results["end_to_end_results"]:
+      e2e_metrics = evaluation_results["end_to_end_results"]["metrics"]
+      print(f"End-to-End Component Accuracy: {e2e_metrics['component_accuracy']:.3f}")
+      print(f"End-to-End Success Rate: {e2e_metrics['success_rate']:.3f}")
+  
+  print(f"\nResults saved to:")
+  print(f"  - Evaluation report: {output_dir}/evaluation_report.json")
+  print(f"  - Confusion matrices: {output_dir}/confusion_matrices.json")
+  print(f"  - Performance metrics: {output_dir}/performance_metrics.json")
+  if PLOTTING_AVAILABLE and generate_visualizations:
+      print(f"  - Visualizations: {output_dir}/evaluation_plots.png")
+
+requirements:
+  - torch>=1.12.0
+  - torchvision>=0.13.0
+  - git+https://github.com/openai/CLIP.git
+  - scikit-learn
+  - numpy
+  - matplotlib
+  - seaborn
+  - pillow
+
+tags:
+  - evaluation
+  - metrics
+  - computer-vision
+  - model-testing
+  - performance-analysis
+  - mlops
+
+version: "1.0.0"

@@ -1,0 +1,288 @@
+name: dataset_split
+display_name: Dataset Split
+description: Splits UI component dataset into train, validation, and test sets with specified ratios
+
+parameters:
+  dataset_url:
+    type: str
+    required: true
+    description: CDN URL of the dataset ZIP file
+  
+  src_relative_path:
+    type: str
+    default: "Classification_Dataset"
+    description: Relative path to source dataset within ZIP
+  
+  train_ratio:
+    type: float
+    default: 0.70
+    validation:
+      min: 0.1
+      max: 0.9
+    description: Training set ratio
+  
+  val_ratio:
+    type: float
+    default: 0.15
+    validation:
+      min: 0.05
+      max: 0.5
+    description: Validation set ratio
+  
+  test_ratio:
+    type: float
+    default: 0.15
+    validation:
+      min: 0.05
+      max: 0.5
+    description: Test set ratio
+  
+  random_seed:
+    type: int
+    default: 42
+    description: Random seed for reproducibility
+  
+  move_instead_of_copy:
+    type: bool
+    default: false
+    description: Move files instead of copying them
+  
+  output_path:
+    type: str
+    default: "./dataset_split"
+    description: Output directory for split dataset
+
+inputs:
+  dataset_source:
+    type: url
+    description: CDN URL containing UI component dataset
+
+outputs:
+  split_dataset:
+    type: dataset
+    description: Dataset split into train/val/test folders
+    path: "{output_path}"
+    
+  manifest:
+    type: file
+    format: csv
+    description: Manifest file with split statistics
+    path: "{output_path}/manifest.csv"
+  
+  summary_stats:
+    type: file
+    format: json
+    description: Summary statistics of the split
+    path: "{output_path}/split_summary.json"
+
+code: |
+  import requests
+  import zipfile
+  import tempfile
+  from pathlib import Path
+  import os, random, shutil
+  from math import floor
+  import pandas as pd
+  
+  # Optional tqdm for progress bars
+  try:
+      from tqdm import tqdm
+  except:
+      tqdm = lambda x, **k: x
+  
+  def download_and_extract_dataset(dataset_url, temp_dir):
+      """Download and extract dataset from CDN URL"""
+      print(f"Downloading dataset from: {dataset_url}")
+      
+      # Download the dataset
+      response = requests.get(dataset_url, stream=True)
+      response.raise_for_status()
+      
+      # Save to temporary file
+      zip_path = temp_dir / "dataset.zip"
+      with open(zip_path, 'wb') as f:
+          for chunk in response.iter_content(chunk_size=8192):
+              f.write(chunk)
+      
+      # Extract the dataset
+      extract_path = temp_dir / "extracted"
+      extract_path.mkdir(exist_ok=True)
+      
+      with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+          zip_ref.extractall(extract_path)
+      
+      return extract_path
+  
+  # Create temporary directory
+  temp_dir = Path(tempfile.mkdtemp())
+  
+  try:
+      # Download and extract dataset
+      extracted_path = download_and_extract_dataset(dataset_url, temp_dir)
+      
+      # Resolve paths
+      src_root = extracted_path
+      if src_relative_path:
+          src_root = src_root / src_relative_path
+      out_root = Path(output_path)
+      
+      print("Source:", src_root)
+      print("Output:", out_root)
+      
+      # ---- Helpers ----
+      ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+      
+      def list_images(folder: Path):
+          return [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in ALLOWED_EXTS]
+      
+      def ensure_dirs(p: Path):
+          p.mkdir(parents=True, exist_ok=True)
+      
+      def transfer(src: Path, dst_dir: Path, move: bool):
+          ensure_dirs(dst_dir)
+          if move:
+              shutil.move(str(src), str(dst_dir / src.name))
+          else:
+              shutil.copy2(src, dst_dir / src.name)
+      
+      def is_category_dir(d: Path):
+          return d.is_dir() and any(child.is_dir() for child in d.iterdir())
+      
+      def get_categories(root: Path):
+          cats = [d for d in root.iterdir() if is_category_dir(d)]
+          if not cats:
+              candidates = [d for d in root.iterdir() if d.is_dir()]
+              for d in candidates:
+                  deeper = [x for x in d.iterdir() if is_category_dir(x)]
+                  if deeper:
+                      return deeper
+          return cats
+      
+      def safe_split(n, train_r, val_r, test_r):
+          """Deterministic integer split with remainder distribution."""
+          base_tr = floor(n * train_r)
+          base_va = floor(n * val_r)
+          base_te = floor(n * test_r)
+          leftover = n - (base_tr + base_va + base_te)
+          parts = [("train", train_r), ("val", val_r), ("test", test_r)]
+          parts.sort(key=lambda x: x[1], reverse=True)
+          counts = {"train": base_tr, "val": base_va, "test": base_te}
+          for name, _ in parts:
+              if leftover <= 0: break
+              counts[name] += 1
+              leftover -= 1
+          return counts["train"], counts["val"], counts["test"]
+      
+      # ---- Validation ----
+      assert abs((train_ratio + val_ratio + test_ratio) - 1.0) < 1e-6, "Ratios must sum to 1.0"
+      random.seed(random_seed)
+      ensure_dirs(out_root)
+      
+      categories = get_categories(src_root)
+      if not categories:
+          raise SystemExit(f"No category folders found under: {src_root}")
+      
+      stats = []   # (category, component, total, train, val, test)
+      for cat in tqdm(categories, desc="Categories"):
+          components = [d for d in cat.iterdir() if d.is_dir()]
+          if not components:
+              print(f"[WARN] No component folders in category: {cat.name}")
+              continue
+      
+          for comp in components:
+              imgs = list_images(comp)
+              if not imgs:
+                  print(f"[WARN] No images in: {cat.name}/{comp.name}")
+                  continue
+      
+              random.shuffle(imgs)
+              n = len(imgs)
+              n_tr, n_va, n_te = safe_split(n, train_ratio, val_ratio, test_ratio)
+      
+              train_files = imgs[:n_tr]
+              val_files   = imgs[n_tr:n_tr+n_va]
+              test_files  = imgs[n_tr+n_va:n_tr+n_va+n_te]
+      
+              for f in train_files:
+                  transfer(f, out_root / "train" / cat.name / comp.name, move=move_instead_of_copy)
+              for f in val_files:
+                  transfer(f, out_root / "val" / cat.name / comp.name, move=move_instead_of_copy)
+              for f in test_files:
+                  transfer(f, out_root / "test" / cat.name / comp.name, move=move_instead_of_copy)
+      
+              stats.append((cat.name, comp.name, n, len(train_files), len(val_files), len(test_files)))
+      
+      print("\nSplit complete. Writing manifest and summary...")
+      
+      # ---- Manifest + Summary ----
+      # Summary per component
+      df = pd.DataFrame(stats, columns=["category","component","total","train","val","test"])
+      print(df.sort_values(["category","component"]).reset_index(drop=True))
+      
+      # File-level manifest
+      rows = []
+      for split in ["train", "val", "test"]:
+          split_dir = out_root / split
+          if not split_dir.exists(): 
+              continue
+          for cat in split_dir.iterdir():
+              if not cat.is_dir(): 
+                  continue
+              for comp in cat.iterdir():
+                  if not comp.is_dir():
+                      continue
+                  for img in comp.iterdir():
+                      if img.suffix.lower() in ALLOWED_EXTS:
+                          rows.append({
+                              "path": str(img),
+                              "split": split,
+                              "category": cat.name,
+                              "component": comp.name
+                          })
+      
+      manifest = pd.DataFrame(rows)
+      manifest_path = out_root / "manifest.csv"
+      manifest.to_csv(manifest_path, index=False)
+      print("Manifest saved to:", manifest_path)
+      
+      # Overall counts check
+      overall = manifest.groupby(["split"]).size().rename("count").reset_index()
+      print(overall)
+      
+      # Summary statistics
+      summary_stats = {
+          "total_images": len(manifest),
+          "categories": df["category"].nunique(),
+          "components": len(df),
+          "splits": {
+              "train": int(overall[overall["split"] == "train"]["count"].iloc[0]) if len(overall[overall["split"] == "train"]) > 0 else 0,
+              "val": int(overall[overall["split"] == "val"]["count"].iloc[0]) if len(overall[overall["split"] == "val"]) > 0 else 0,
+              "test": int(overall[overall["split"] == "test"]["count"].iloc[0]) if len(overall[overall["split"] == "test"]) > 0 else 0
+          },
+          "category_distribution": df.groupby("category")["total"].sum().to_dict()
+      }
+      
+      # Save summary
+      import json
+      with open(out_root / "split_summary.json", "w") as f:
+          json.dump(summary_stats, f, indent=2)
+      
+      print("Output tree root:", out_root)
+      
+  finally:
+      # Clean up temporary directory
+      shutil.rmtree(temp_dir, ignore_errors=True)
+
+requirements:
+  - requests
+  - pandas
+  - tqdm
+  - pathlib
+
+tags:
+  - data-preprocessing
+  - dataset-split
+  - computer-vision
+  - mlops
+
+version: "1.0.0"

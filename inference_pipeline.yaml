@@ -1,0 +1,874 @@
+name: inference_pipeline
+display_name: Inference Pipeline
+description: Complete two-phase inference pipeline for UI component classification
+
+parameters:
+  phase1_model_dir:
+    type: str
+    default: "./phase1_resnet50"
+    description: Directory containing Phase 1 model
+  
+  phase2_model_dir:
+    type: str
+    default: "./phase2_clip_models"
+    description: Directory containing Phase 2 models
+  
+  output_dir:
+    type: str
+    default: "./inference_results"
+    description: Directory to save inference results
+  
+  test_images_url:
+    type: str
+    required: false
+    description: CDN URL of test images ZIP file (optional)
+  
+  test_images_path:
+    type: str
+    default: "./test_images"
+    description: Local path for test images
+  
+  topk_category:
+    type: int
+    default: 3
+    validation:
+      min: 1
+      max: 10
+    description: Top-k categories to consider
+  
+  topk_component:
+    type: int
+    default: 5
+    validation:
+      min: 1
+      max: 20
+    description: Top-k components to consider
+  
+  category_threshold:
+    type: float
+    default: 0.3
+    validation:
+      min: 0.0
+      max: 1.0
+    description: Confidence threshold for category prediction
+  
+  component_threshold:
+    type: float
+    default: 0.25
+    validation:
+      min: 0.0
+      max: 1.0
+    description: Confidence threshold for component prediction
+  
+  batch_inference:
+    type: bool
+    default: true
+    description: Enable batch processing for faster inference
+
+inputs:
+  phase1_trained_model:
+    type: file
+    format: pt
+    description: Trained Phase 1 model checkpoint
+    path: "{phase1_model_dir}/phase1_best.pt"
+  
+  phase2_trained_models:
+    type: dict
+    description: Dictionary of trained Phase 2 model checkpoints
+    path: "{phase2_model_dir}"
+  
+  test_images:
+    type: dataset
+    description: Images for inference (optional)
+    path: "{test_images_path}"
+
+outputs:
+  predictions:
+    type: file
+    format: json
+    description: Inference results and predictions
+    path: "{output_dir}/predictions.json"
+  
+  pipeline_model:
+    type: object
+    description: Complete inference pipeline object
+  
+  performance_metrics:
+    type: file
+    format: json
+    description: Inference performance metrics
+    path: "{output_dir}/performance_metrics.json"
+  
+  error_analysis:
+    type: file
+    format: json
+    description: Error analysis and failed predictions
+    path: "{output_dir}/error_analysis.json"
+
+code: |
+  import json
+  import time
+  import warnings
+  import requests
+  import zipfile
+  import tempfile
+  from pathlib import Path
+  from PIL import Image
+  import torch
+  import torch.nn as nn
+  import torch.nn.functional as F
+  from torchvision.models import resnet50, ResNet50_Weights
+  from torchvision import transforms
+  import os
+  from collections import defaultdict, Counter
+  
+  # Install CLIP if needed
+  try:
+      import clip
+  except ImportError:
+      import subprocess
+      import sys
+      print("Installing CLIP...")
+      subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/openai/CLIP.git"])
+      import clip
+  
+  warnings.filterwarnings("ignore")
+  
+  # Setup
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  output_dir = Path(output_dir)
+  output_dir.mkdir(parents=True, exist_ok=True)
+  
+  # Supported image extensions
+  IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp'}
+  
+  def download_test_images(test_images_url, output_path):
+      """Download and extract test images from CDN URL"""
+      if not test_images_url:
+          return None
+          
+      print(f"Downloading test images from: {test_images_url}")
+      
+      temp_dir = Path(tempfile.mkdtemp())
+      try:
+          # Download the dataset
+          response = requests.get(test_images_url, stream=True)
+          response.raise_for_status()
+          
+          # Save to temporary file
+          zip_path = temp_dir / "test_images.zip"
+          with open(zip_path, 'wb') as f:
+              for chunk in response.iter_content(chunk_size=8192):
+                  f.write(chunk)
+          
+          # Extract the dataset
+          extract_path = Path(output_path)
+          extract_path.mkdir(parents=True, exist_ok=True)
+          
+          with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+              zip_ref.extractall(extract_path)
+          
+          print(f"Test images extracted to: {extract_path}")
+          return extract_path
+          
+      except Exception as e:
+          print(f"Error downloading test images: {e}")
+          return None
+      finally:
+          # Clean up
+          import shutil
+          shutil.rmtree(temp_dir, ignore_errors=True)
+  
+  class CategoryClassifier:
+      """Phase 1: ResNet50-based category classifier"""
+      
+      def __init__(self, model_dir):
+          self.model_dir = Path(model_dir)
+          self.device = device
+          
+          self._load_model()
+          self._setup_transforms()
+      
+      def _load_model(self):
+          """Load the trained ResNet50 model"""
+          model_path = self.model_dir / "phase1_best.pt"
+          
+          if not model_path.exists():
+              raise FileNotFoundError(f"Phase 1 model not found: {model_path}")
+          
+          # Load checkpoint
+          checkpoint = torch.load(model_path, map_location="cpu")
+          
+          # Extract mappings
+          self.category_to_idx = checkpoint["category_to_idx"]
+          self.idx_to_category = checkpoint["idx_to_category"]
+          if isinstance(list(self.idx_to_category.keys())[0], str):
+              self.idx_to_category = {int(k): v for k, v in self.idx_to_category.items()}
+          
+          self.num_categories = len(self.category_to_idx)
+          
+          # Create model with same architecture as training
+          self.model = resnet50(weights=None)
+          self.model.fc = nn.Sequential(
+              nn.Dropout(p=0.2),
+              nn.Linear(self.model.fc.in_features, self.num_categories)
+          )
+          
+          # Load trained weights
+          self.model.load_state_dict(checkpoint["model_state"])
+          self.model.eval()
+          self.model.to(self.device)
+          
+          # Get image size from checkpoint
+          self.image_size = checkpoint.get("image_size", 224)
+          
+          print(f"✅ Phase 1 model loaded: {self.num_categories} categories")
+      
+      def _setup_transforms(self):
+          """Setup image preprocessing transforms"""
+          imagenet_stats = ResNet50_Weights.IMAGENET1K_V2.transforms()
+          
+          self.transform = transforms.Compose([
+              transforms.Resize((self.image_size, self.image_size)),
+              transforms.ToTensor(),
+              transforms.Normalize(mean=imagenet_stats.mean, std=imagenet_stats.std)
+          ])
+      
+      @torch.no_grad()
+      def predict(self, image_path, topk=topk_category):
+          """Predict category for an image"""
+          try:
+              image = Image.open(image_path).convert("RGB")
+          except Exception as e:
+              raise ValueError(f"Could not load image {image_path}: {e}")
+          
+          # Transform and add batch dimension
+          x = self.transform(image).unsqueeze(0).to(self.device)
+          
+          # Forward pass
+          with torch.no_grad():
+              logits = self.model(x)
+              probs = F.softmax(logits, dim=-1).squeeze(0)
+          
+          # Get top-k predictions
+          top_probs, top_indices = torch.topk(probs, k=min(topk, len(probs)))
+          
+          results = []
+          for i in range(len(top_probs)):
+              idx = top_indices[i].item()
+              prob = top_probs[i].item()
+              category = self.idx_to_category[idx]
+              results.append((category, prob))
+          
+          return results
+      
+      @torch.no_grad()
+      def predict_batch(self, image_paths, topk=topk_category):
+          """Predict categories for a batch of images"""
+          images = []
+          valid_paths = []
+          
+          for img_path in image_paths:
+              try:
+                  image = Image.open(img_path).convert("RGB")
+                  images.append(self.transform(image))
+                  valid_paths.append(img_path)
+              except Exception as e:
+                  print(f"Skipping {img_path}: {e}")
+          
+          if not images:
+              return []
+          
+          # Stack images into batch
+          batch = torch.stack(images).to(self.device)
+          
+          # Forward pass
+          with torch.no_grad():
+              logits = self.model(batch)
+              probs = F.softmax(logits, dim=-1)
+          
+          results = []
+          for i, img_path in enumerate(valid_paths):
+              # Get top-k predictions for this image
+              img_probs = probs[i]
+              top_probs, top_indices = torch.topk(img_probs, k=min(topk, len(img_probs)))
+              
+              img_results = []
+              for j in range(len(top_probs)):
+                  idx = top_indices[j].item()
+                  prob = top_probs[j].item()
+                  category = self.idx_to_category[idx]
+                  img_results.append((category, prob))
+              
+              results.append((img_path, img_results))
+          
+          return results
+  
+  class ComponentClassifier:
+      """Phase 2: CLIP-based component classifiers for each category"""
+      
+      def __init__(self, models_dir):
+          self.models_dir = Path(models_dir)
+          self.device = device
+          self.loaded_models = {}  # Cache for loaded models
+          
+          self._discover_available_models()
+      
+      def _discover_available_models(self):
+          """Find all available category models"""
+          self.available_models = {}
+          
+          # Look for model files
+          for model_file in self.models_dir.glob("*_clip_best.pt"):
+              # Extract category name from filename
+              category_name = model_file.stem.replace("_clip_best", "")
+              self.available_models[category_name.upper()] = model_file
+          
+          if not self.available_models:
+              raise FileNotFoundError("No Phase 2 models found!")
+          
+          print(f"✅ Found {len(self.available_models)} Phase 2 models")
+      
+      def _load_model_for_category(self, category):
+          """Load CLIP model and head for a specific category"""
+          category_upper = category.upper()
+          
+          # Check if already loaded
+          if category_upper in self.loaded_models:
+              return self.loaded_models[category_upper]
+          
+          # Find model file
+          if category_upper not in self.available_models:
+              raise ValueError(f"No model found for category: {category}. Available: {list(self.available_models.keys())}")
+          
+          model_file = self.available_models[category_upper]
+          
+          try:
+              # Load checkpoint
+              checkpoint = torch.load(model_file, map_location="cpu")
+              
+              # Load CLIP backbone
+              clip_model, _ = clip.load("ViT-B/32", device=self.device)
+              clip_model.load_state_dict(checkpoint["clip_model_state"])
+              
+              # Ensure CLIP model is in float32
+              clip_model.float()
+              clip_model.eval()
+              
+              # Create classification head
+              feature_dim = clip_model.visual.output_dim  # Should be 512
+              num_classes = len(checkpoint["components"])
+              
+              head = nn.Sequential(
+                  nn.Dropout(0.1),
+                  nn.Linear(feature_dim, num_classes)
+              )
+              head.load_state_dict(checkpoint["head_state"])
+              
+              # Ensure head is also in float32
+              head.float()
+              head.eval()
+              head.to(self.device)
+              
+              # Setup preprocessing
+              preprocess = transforms.Compose([
+                  transforms.Resize((224, 224)),
+                  transforms.ToTensor(),
+                  transforms.Normalize(
+                      mean=[0.48145466, 0.4578275, 0.40821073],
+                      std=[0.26862954, 0.26130258, 0.27577711]
+                  )
+              ])
+              
+              # Ensure idx_to_component mapping has correct key types
+              idx_to_component = {}
+              if 'idx_to_component' in checkpoint:
+                  for k, v in checkpoint['idx_to_component'].items():
+                      idx_to_component[int(k)] = v
+              else:
+                  idx_to_component = {i: comp for i, comp in enumerate(checkpoint['components'])}
+              
+              # Store model info
+              model_info = {
+                  'clip_model': clip_model,
+                  'head': head,
+                  'preprocess': preprocess,
+                  'components': checkpoint['components'],
+                  'component_to_idx': checkpoint['component_to_idx'],
+                  'idx_to_component': idx_to_component
+              }
+              
+              self.loaded_models[category_upper] = model_info
+              return model_info
+              
+          except Exception as e:
+              raise RuntimeError(f"Failed to load model for {category}: {e}")
+      
+      @torch.no_grad() 
+      def predict(self, image_path, category, topk=topk_component):
+          """Predict component within a category"""
+          # Load model for this category
+          model_info = self._load_model_for_category(category)
+          
+          # Load and preprocess image
+          try:
+              image = Image.open(image_path).convert("RGB")
+          except Exception as e:
+              raise ValueError(f"Could not load image {image_path}: {e}")
+          
+          # Preprocess image
+          x = model_info['preprocess'](image).unsqueeze(0).to(self.device)
+          
+          # Extract CLIP features
+          features = model_info['clip_model'].encode_image(x)
+          features = features / features.norm(dim=-1, keepdim=True)  # L2 normalize
+          
+          # Ensure features are float32 before passing to head
+          features = features.float()
+          
+          # Classify with head
+          logits = model_info['head'](features)
+          probs = F.softmax(logits, dim=-1).squeeze(0)
+          
+          # Get top-k predictions
+          top_probs, top_indices = torch.topk(probs, k=min(topk, len(probs)))
+          
+          results = []
+          for i in range(len(top_probs)):
+              idx = top_indices[i].item()
+              prob = top_probs[i].item()
+              
+              if idx in model_info['idx_to_component']:
+                  component = model_info['idx_to_component'][idx]
+              else:
+                  if idx < len(model_info['components']):
+                      component = model_info['components'][idx]
+                  else:
+                      component = f"UNKNOWN_COMPONENT_{idx}"
+              
+              results.append((component, prob))
+          
+          return results
+      
+      @torch.no_grad()
+      def predict_batch(self, image_paths, category, topk=topk_component):
+          """Predict components for a batch of images within a category"""
+          model_info = self._load_model_for_category(category)
+          
+          images = []
+          valid_paths = []
+          
+          for img_path in image_paths:
+              try:
+                  image = Image.open(img_path).convert("RGB")
+                  images.append(model_info['preprocess'](image))
+                  valid_paths.append(img_path)
+              except Exception as e:
+                  print(f"Skipping {img_path}: {e}")
+          
+          if not images:
+              return []
+          
+          # Stack images into batch
+          batch = torch.stack(images).to(self.device)
+          
+          # Extract CLIP features
+          features = model_info['clip_model'].encode_image(batch)
+          features = features / features.norm(dim=-1, keepdim=True)
+          features = features.float()
+          
+          # Classify with head
+          logits = model_info['head'](features)
+          probs = F.softmax(logits, dim=-1)
+          
+          results = []
+          for i, img_path in enumerate(valid_paths):
+              img_probs = probs[i]
+              top_probs, top_indices = torch.topk(img_probs, k=min(topk, len(img_probs)))
+              
+              img_results = []
+              for j in range(len(top_probs)):
+                  idx = top_indices[j].item()
+                  prob = top_probs[j].item()
+                  
+                  if idx in model_info['idx_to_component']:
+                      component = model_info['idx_to_component'][idx]
+                  else:
+                      if idx < len(model_info['components']):
+                          component = model_info['components'][idx]
+                      else:
+                          component = f"UNKNOWN_COMPONENT_{idx}"
+                  
+                  img_results.append((component, prob))
+              
+              results.append((img_path, img_results))
+          
+          return results
+  
+  class UIComponentPredictor:
+      """Complete two-phase UI component classification system"""
+      
+      def __init__(self, phase1_dir, phase2_dir, verbose=False):
+          if verbose:
+              print("Initializing UI Component Predictor...")
+          
+          # Initialize both phases
+          self.phase1 = CategoryClassifier(phase1_dir)
+          self.phase2 = ComponentClassifier(phase2_dir)
+          
+          # Performance tracking
+          self.prediction_times = []
+          self.category_distribution = Counter()
+          self.component_distribution = Counter()
+          self.errors = []
+          
+          if verbose:
+              print("✅ UI Component Predictor ready!")
+      
+      def predict_single(self, image_path, detailed=False):
+          """Predict UI component category and type for a single image"""
+          start_time = time.time()
+          
+          try:
+              # Phase 1: Category prediction
+              category_results = self.phase1.predict(image_path, topk=topk_category)
+              best_category, best_cat_conf = category_results[0]
+              
+              # Check category confidence threshold
+              if best_cat_conf < category_threshold:
+                  return {
+                      "image_name": os.path.basename(image_path),
+                      "predicted_category": best_category,
+                      "category_confidence": float(best_cat_conf),
+                      "predicted_component": "LOW_CONFIDENCE",
+                      "component_confidence": 0.0,
+                      "full_prediction": f"{best_category}/LOW_CONFIDENCE",
+                      "success": True,
+                      "warning": "Category confidence below threshold"
+                  }
+              
+              # Phase 2: Component prediction
+              component_results = self.phase2.predict(image_path, best_category, topk=topk_component)
+              best_component, best_comp_conf = component_results[0]
+              
+              # Check component confidence threshold
+              if best_comp_conf < component_threshold:
+                  best_component = "LOW_CONFIDENCE"
+                  best_comp_conf = 0.0
+              
+              prediction_time = time.time() - start_time
+              self.prediction_times.append(prediction_time)
+              self.category_distribution[best_category] += 1
+              self.component_distribution[f"{best_category}/{best_component}"] += 1
+              
+              result = {
+                  "image_name": os.path.basename(image_path),
+                  "predicted_category": best_category,
+                  "category_confidence": float(best_cat_conf),
+                  "predicted_component": best_component,
+                  "component_confidence": float(best_comp_conf),
+                  "full_prediction": f"{best_category}/{best_component}",
+                  "prediction_time": prediction_time,
+                  "success": True
+              }
+              
+              if detailed:
+                  result.update({
+                      "top_categories": [(cat, float(conf)) for cat, conf in category_results[:topk_category]],
+                      "top_components": [(comp, float(conf)) for comp, conf in component_results[:topk_component]]
+                  })
+              
+              return result
+              
+          except Exception as e:
+              error_info = {
+                  "image_name": os.path.basename(image_path),
+                  "error": str(e),
+                  "error_type": type(e).__name__,
+                  "success": False
+              }
+              self.errors.append(error_info)
+              return error_info
+      
+      def predict_batch(self, image_paths, batch_size=32):
+          """Predict UI components for a batch of images with optimized processing"""
+          if not batch_inference or len(image_paths) <= batch_size:
+              # Process all at once
+              return self._predict_batch_internal(image_paths)
+          else:
+              # Process in chunks
+              results = []
+              for i in range(0, len(image_paths), batch_size):
+                  batch = image_paths[i:i+batch_size]
+                  batch_results = self._predict_batch_internal(batch)
+                  results.extend(batch_results)
+              return results
+      
+      def _predict_batch_internal(self, image_paths):
+          """Internal batch prediction with phase-wise optimization"""
+          results = []
+          start_time = time.time()
+          
+          try:
+              # Phase 1: Batch category prediction
+              category_batch_results = self.phase1.predict_batch(image_paths, topk=1)
+              
+              # Group images by predicted category for Phase 2
+              category_groups = defaultdict(list)
+              category_confidences = {}
+              
+              for img_path, cat_results in category_batch_results:
+                  if cat_results:
+                      best_category, best_conf = cat_results[0]
+                      if best_conf >= category_threshold:
+                          category_groups[best_category].append(img_path)
+                          category_confidences[img_path] = (best_category, best_conf)
+                      else:
+                          # Low confidence category
+                          results.append({
+                              "image_name": os.path.basename(img_path),
+                              "predicted_category": best_category,
+                              "category_confidence": float(best_conf),
+                              "predicted_component": "LOW_CONFIDENCE",
+                              "component_confidence": 0.0,
+                              "full_prediction": f"{best_category}/LOW_CONFIDENCE",
+                              "success": True,
+                              "warning": "Category confidence below threshold"
+                          })
+              
+              # Phase 2: Batch component prediction per category
+              for category, cat_image_paths in category_groups.items():
+                  try:
+                      component_batch_results = self.phase2.predict_batch(cat_image_paths, category, topk=1)
+                      
+                      for img_path, comp_results in component_batch_results:
+                          if comp_results:
+                              best_component, best_comp_conf = comp_results[0]
+                              
+                              if best_comp_conf < component_threshold:
+                                  best_component = "LOW_CONFIDENCE"
+                                  best_comp_conf = 0.0
+                              
+                              cat_name, cat_conf = category_confidences[img_path]
+                              
+                              results.append({
+                                  "image_name": os.path.basename(img_path),
+                                  "predicted_category": cat_name,
+                                  "category_confidence": float(cat_conf),
+                                  "predicted_component": best_component,
+                                  "component_confidence": float(best_comp_conf),
+                                  "full_prediction": f"{cat_name}/{best_component}",
+                                  "success": True
+                              })
+                              
+                              # Update tracking
+                              self.category_distribution[cat_name] += 1
+                              self.component_distribution[f"{cat_name}/{best_component}"] += 1
+                  
+                  except Exception as e:
+                      # Handle category-specific errors
+                      for img_path in cat_image_paths:
+                          error_info = {
+                              "image_name": os.path.basename(img_path),
+                              "error": f"Phase 2 error for category {category}: {str(e)}",
+                              "error_type": type(e).__name__,
+                              "success": False
+                          }
+                          results.append(error_info)
+                          self.errors.append(error_info)
+              
+              batch_time = time.time() - start_time
+              self.prediction_times.append(batch_time / len(image_paths))  # Per image time
+              
+          except Exception as e:
+              # Handle batch-level errors
+              for img_path in image_paths:
+                  error_info = {
+                      "image_name": os.path.basename(img_path),
+                      "error": f"Batch processing error: {str(e)}",
+                      "error_type": type(e).__name__,
+                      "success": False
+                  }
+                  results.append(error_info)
+                  self.errors.append(error_info)
+          
+          return results
+      
+      def predict_folder(self, folder_path):
+          """Predict UI components for all images in a folder"""
+          folder_path = Path(folder_path)
+          
+          if not folder_path.exists():
+              raise FileNotFoundError(f"Folder not found: {folder_path}")
+          
+          # Find all image files
+          image_files = []
+          for ext in IMAGE_EXTENSIONS:
+              image_files.extend(folder_path.glob(f"*{ext}"))
+              image_files.extend(folder_path.glob(f"*{ext.upper()}"))
+          
+          if not image_files:
+              return []
+          
+          print(f"Found {len(image_files)} images in {folder_path}")
+          
+          # Use batch processing if enabled and multiple images
+          if batch_inference and len(image_files) > 1:
+              return self.predict_batch(image_files)
+          else:
+              results = []
+              for image_file in image_files:
+                  result = self.predict_single(image_file)
+                  results.append(result)
+              return results
+      
+      def predict(self, path):
+          """Predict UI components for either a single image or folder of images"""
+          path = Path(path)
+          
+          if not path.exists():
+              raise FileNotFoundError(f"Path not found: {path}")
+          
+          if path.is_file():
+              return [self.predict_single(path, detailed=True)]
+          elif path.is_dir():
+              return self.predict_folder(path)
+          else:
+              raise ValueError(f"Invalid path: {path}")
+      
+      def get_performance_metrics(self):
+          """Get performance metrics for the inference pipeline"""
+          if not self.prediction_times:
+              return {"error": "No predictions made yet"}
+          
+          return {
+              "total_predictions": len(self.prediction_times),
+              "successful_predictions": len(self.prediction_times) - len(self.errors),
+              "failed_predictions": len(self.errors),
+              "success_rate": (len(self.prediction_times) - len(self.errors)) / len(self.prediction_times) if self.prediction_times else 0,
+              "average_prediction_time": sum(self.prediction_times) / len(self.prediction_times),
+              "min_prediction_time": min(self.prediction_times),
+              "max_prediction_time": max(self.prediction_times),
+              "predictions_per_second": 1 / (sum(self.prediction_times) / len(self.prediction_times)) if self.prediction_times else 0,
+              "category_distribution": dict(self.category_distribution),
+              "top_components": dict(self.component_distribution.most_common(10)),
+              "error_types": Counter([err.get("error_type", "Unknown") for err in self.errors])
+          }
+      
+      def get_error_analysis(self):
+          """Get detailed error analysis"""
+          return {
+              "total_errors": len(self.errors),
+              "errors": self.errors,
+              "error_distribution": dict(Counter([err.get("error_type", "Unknown") for err in self.errors])),
+              "common_error_messages": dict(Counter([err.get("error", "Unknown")[:100] for err in self.errors]).most_common(5))
+          }
+  
+  # Download test images if URL provided
+  if test_images_url:
+      downloaded_path = download_test_images(test_images_url, test_images_path)
+      if downloaded_path:
+          test_images_path = str(downloaded_path)
+  
+  # Initialize the predictor
+  try:
+      predictor = UIComponentPredictor(phase1_model_dir, phase2_model_dir, verbose=True)
+      print("✅ Inference pipeline initialized successfully")
+  except Exception as e:
+      print(f"❌ Failed to initialize predictor: {e}")
+      raise
+  
+  # Run inference if test images are available
+  predictions = []
+  if Path(test_images_path).exists():
+      print(f"\nRunning inference on test images: {test_images_path}")
+      
+      start_time = time.time()
+      predictions = predictor.predict(test_images_path)
+      total_time = time.time() - start_time
+      
+      print(f"✅ Completed inference on {len(predictions)} images in {total_time:.2f}s")
+      
+      # Save predictions
+      predictions_file = output_dir / "predictions.json"
+      with open(predictions_file, 'w') as f:
+          json.dump(predictions, f, indent=2)
+      
+      print(f"💾 Predictions saved to: {predictions_file}")
+      
+      # Generate performance metrics
+      performance_metrics = predictor.get_performance_metrics()
+      performance_metrics["total_inference_time"] = total_time
+      performance_metrics["images_processed"] = len(predictions)
+      
+      metrics_file = output_dir / "performance_metrics.json"
+      with open(metrics_file, 'w') as f:
+          json.dump(performance_metrics, f, indent=2)
+      
+      # Generate error analysis
+      error_analysis = predictor.get_error_analysis()
+      error_file = output_dir / "error_analysis.json"
+      with open(error_file, 'w') as f:
+          json.dump(error_analysis, f, indent=2)
+      
+      # Print summary
+      successful = sum(1 for p in predictions if p.get('success', False))
+      failed = len(predictions) - successful
+      
+      print(f"\n" + "="*60)
+      print("INFERENCE SUMMARY")
+      print("="*60)
+      print(f"Images processed: {len(predictions)}")
+      print(f"Successful predictions: {successful}")
+      print(f"Failed predictions: {failed}")
+      print(f"Success rate: {(successful/len(predictions)*100):.1f}%")
+      print(f"Average time per image: {total_time/len(predictions):.3f}s")
+      print(f"Throughput: {len(predictions)/total_time:.1f} images/sec")
+      
+      if successful > 0:
+          # Show sample successful predictions
+          sample_predictions = [p for p in predictions if p.get('success', False)][:5]
+          print(f"\nSample predictions:")
+          for pred in sample_predictions:
+              print(f"  {pred['image_name']}: {pred['full_prediction']} "
+                    f"(cat: {pred['category_confidence']:.3f}, comp: {pred['component_confidence']:.3f})")
+      
+      if failed > 0:
+          print(f"\nErrors occurred: {failed}")
+          error_types = Counter([err.get('error_type', 'Unknown') for err in predictor.errors])
+          for error_type, count in error_types.most_common(3):
+              print(f"  {error_type}: {count}")
+  
+  else:
+      print(f"⚠️  No test images found at: {test_images_path}")
+      print("Inference pipeline is ready for use")
+  
+  # Save the pipeline model for later use
+  pipeline_model = predictor
+  
+  print(f"\n" + "="*60)
+  print("INFERENCE PIPELINE READY")
+  print("="*60)
+  print("Usage:")
+  print("  # Single image: predictor.predict('/path/to/image.jpg')")
+  print("  # Folder: predictor.predict('/path/to/folder')")
+  print("  # Get metrics: predictor.get_performance_metrics()")
+  print("="*60)
+
+requirements:
+  - torch>=1.12.0
+  - torchvision>=0.13.0
+  - git+https://github.com/openai/CLIP.git
+  - pillow
+  - requests
+  - numpy
+
+tags:
+  - inference
+  - pipeline
+  - computer-vision
+  - deployment
+  - mlops
+  - batch-processing
+
+version: "1.0.0"

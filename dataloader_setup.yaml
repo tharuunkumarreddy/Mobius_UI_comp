@@ -1,0 +1,426 @@
+name: dataloader_setup
+display_name: DataLoader Setup
+description: Creates PyTorch DataLoaders for training and validation with appropriate transforms
+
+parameters:
+  data_root:
+    type: str
+    default: "./dataset_split"
+    description: Root directory of split dataset
+  
+  label_mappings_dir:
+    type: str
+    default: "./label_mappings"
+    description: Directory containing label mappings
+  
+  batch_size:
+    type: int
+    default: 32
+    validation:
+      min: 1
+      max: 512
+    description: Batch size for data loaders
+  
+  image_size:
+    type: int
+    default: 224
+    validation:
+      min: 32
+      max: 1024
+    description: Image size for resizing
+  
+  num_workers:
+    type: int
+    default: 2
+    validation:
+      min: 0
+      max: 16
+    description: Number of workers for data loading
+  
+  pin_memory:
+    type: bool
+    default: true
+    description: Pin memory for faster GPU transfer
+  
+  augmentation_strength:
+    type: str
+    default: "medium"
+    options: ["none", "light", "medium", "strong"]
+    description: Data augmentation strength
+  
+  normalization_type:
+    type: str
+    default: "imagenet"
+    options: ["imagenet", "clip", "custom"]
+    description: Type of normalization to apply
+
+inputs:
+  split_dataset:
+    type: dataset
+    description: Dataset with train/val/test splits
+    path: "{data_root}"
+  
+  label_mappings:
+    type: file
+    format: json
+    description: Category and component label mappings
+    path: "{label_mappings_dir}"
+
+outputs:
+  train_loader:
+    type: object
+    description: Training data loader
+  
+  val_loader:
+    type: object
+    description: Validation data loader
+  
+  test_loader:
+    type: object
+    description: Test data loader (optional)
+  
+  dataset_info:
+    type: dict
+    description: Information about datasets and loaders
+  
+  transform_configs:
+    type: dict
+    description: Transform configuration used
+
+code: |
+  import json
+  from pathlib import Path
+  import torch
+  from torch.utils.data import Dataset, DataLoader
+  from torchvision import transforms
+  from PIL import Image
+  from collections import defaultdict
+  import numpy as np
+  
+  # Load label mappings
+  mappings_dir = Path(label_mappings_dir)
+  
+  try:
+      with open(mappings_dir / "category_to_idx.json") as f:
+          category_to_idx = json.load(f)
+      
+      with open(mappings_dir / "component_mappings.json") as f:
+          component_mappings = json.load(f)
+          
+      with open(mappings_dir / "mapping_summary.json") as f:
+          mapping_summary = json.load(f)
+  except FileNotFoundError as e:
+      raise FileNotFoundError(f"Label mapping files not found in {mappings_dir}. Run label_mapping brick first.")
+  
+  # Image extensions
+  IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+  
+  def get_normalization_params(normalization_type):
+      """Get normalization parameters based on type"""
+      if normalization_type == "imagenet":
+          return {
+              "mean": [0.485, 0.456, 0.406],
+              "std": [0.229, 0.224, 0.225]
+          }
+      elif normalization_type == "clip":
+          return {
+              "mean": [0.48145466, 0.4578275, 0.40821073],
+              "std": [0.26862954, 0.26130258, 0.27577711]
+          }
+      elif normalization_type == "custom":
+          # Can be extended to calculate dataset-specific stats
+          return {
+              "mean": [0.5, 0.5, 0.5],
+              "std": [0.5, 0.5, 0.5]
+          }
+      else:
+          raise ValueError(f"Unsupported normalization type: {normalization_type}")
+  
+  def create_transforms(image_size, augmentation_strength, normalization_type):
+      """Create training and evaluation transforms"""
+      norm_params = get_normalization_params(normalization_type)
+      
+      # Base evaluation transforms
+      eval_transforms = [
+          transforms.Resize((image_size, image_size)),
+          transforms.ToTensor(),
+          transforms.Normalize(mean=norm_params["mean"], std=norm_params["std"])
+      ]
+      
+      # Training transforms based on augmentation strength
+      if augmentation_strength == "none":
+          train_transforms = eval_transforms.copy()
+      elif augmentation_strength == "light":
+          train_transforms = [
+              transforms.Resize((image_size, image_size)),
+              transforms.RandomHorizontalFlip(p=0.3),
+              transforms.ToTensor(),
+              transforms.Normalize(mean=norm_params["mean"], std=norm_params["std"])
+          ]
+      elif augmentation_strength == "medium":
+          train_transforms = [
+              transforms.Resize((image_size, image_size)),
+              transforms.RandomHorizontalFlip(p=0.5),
+              transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+              transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.15, hue=0.02),
+              transforms.ToTensor(),
+              transforms.Normalize(mean=norm_params["mean"], std=norm_params["std"])
+          ]
+      elif augmentation_strength == "strong":
+          train_transforms = [
+              transforms.Resize((image_size, image_size)),
+              transforms.RandomHorizontalFlip(p=0.5),
+              transforms.RandomResizedCrop(image_size, scale=(0.7, 1.0)),
+              transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05),
+              transforms.RandomRotation(degrees=10),
+              transforms.RandomGrayscale(p=0.1),
+              transforms.ToTensor(),
+              transforms.Normalize(mean=norm_params["mean"], std=norm_params["std"])
+          ]
+      else:
+          raise ValueError(f"Unsupported augmentation strength: {augmentation_strength}")
+      
+      return transforms.Compose(train_transforms), transforms.Compose(eval_transforms)
+  
+  def list_category_paths(split_dir: Path):
+      """Get immediate subfolders inside split/ (these are categories)"""
+      if not split_dir.exists():
+          return []
+      return sorted([p for p in split_dir.iterdir() if p.is_dir()])
+  
+  def list_images_under_category(category_dir: Path):
+      """Images live under category/component/*.ext (two levels)"""
+      files = []
+      if not category_dir.exists():
+          return files
+          
+      for comp_dir in category_dir.iterdir():
+          if comp_dir.is_dir():
+              for f in comp_dir.iterdir():
+                  if f.is_file() and f.suffix.lower() in IMG_EXTS:
+                      files.append(f)
+      return files
+  
+  class UICategoryDataset(Dataset):
+      """Labels each image by its CATEGORY (parent of component)."""
+      def __init__(self, split_root: Path, category_to_idx: dict, transform=None, max_samples=None):
+          self.transform = transform
+          self.samples = []
+          self.category_to_idx = category_to_idx
+          self.category_counts = defaultdict(int)
+  
+          # Gather (path, category_idx)
+          for cat in sorted(category_to_idx.keys()):
+              cat_dir = split_root / cat
+              if not cat_dir.exists(): 
+                  continue
+              
+              images = list_images_under_category(cat_dir)
+              if max_samples:
+                  # Limit samples per category for testing
+                  images = images[:max_samples]
+              
+              for img_path in images:
+                  self.samples.append((img_path, category_to_idx[cat]))
+                  self.category_counts[cat] += 1
+  
+          if len(self.samples) == 0:
+              raise RuntimeError(f"No images found under {split_root}. Check paths.")
+          
+          print(f"Loaded {len(self.samples)} samples from {split_root}")
+          for cat, count in self.category_counts.items():
+              print(f"  {cat}: {count} images")
+  
+      def __len__(self): 
+          return len(self.samples)
+  
+      def __getitem__(self, idx):
+          path, y = self.samples[idx]
+          try:
+              img = Image.open(path).convert("RGB")
+              if self.transform: 
+                  img = self.transform(img)
+              return img, y
+          except Exception as e:
+              print(f"Error loading image {path}: {e}")
+              # Return a black image as fallback
+              img = Image.new('RGB', (image_size, image_size), color=(0, 0, 0))
+              if self.transform:
+                  img = self.transform(img)
+              return img, y
+  
+  class CategoryComponentDataset(Dataset):
+      """Dataset for loading images from a specific category with component-level labels."""
+      def __init__(self, root: Path, category: str, component_mappings: dict, split: str = "train", transform=None):
+          self.transform = transform
+          self.category = category
+          self.split = split
+          
+          # Get components for this category
+          if category not in component_mappings:
+              raise ValueError(f"No components found for category: {category}")
+          
+          self.component_to_idx = component_mappings[category]["component_to_idx"]
+          self.components = component_mappings[category]["components"]
+          
+          # Build samples list
+          self.samples = []
+          category_folder = root / split / category
+          
+          if not category_folder.exists():
+              raise FileNotFoundError(f"Category folder not found: {category_folder}")
+          
+          for component in self.components:
+              component_dir = category_folder / component
+              if component_dir.exists():
+                  for img_path in component_dir.iterdir():
+                      if img_path.suffix.lower() in IMG_EXTS:
+                          self.samples.append((img_path, self.component_to_idx[component]))
+          
+          if len(self.samples) == 0:
+              raise ValueError(f"No samples found for category {category} in {split} split")
+
+      def __len__(self):
+          return len(self.samples)
+
+      def __getitem__(self, idx):
+          img_path, label = self.samples[idx]
+          try:
+              img = Image.open(img_path).convert("RGB")
+              if self.transform:
+                  img = self.transform(img)
+              return img, label
+          except Exception as e:
+              print(f"Error loading image {img_path}: {e}")
+              # Return a black image as fallback
+              img = Image.new('RGB', (image_size, image_size), color=(0, 0, 0))
+              if self.transform:
+                  img = self.transform(img)
+              return img, label
+
+  # Create transforms
+  train_tfms, eval_tfms = create_transforms(image_size, augmentation_strength, normalization_type)
+  
+  # Setup paths
+  data_root = Path(data_root)
+  train_root = data_root / "train"
+  val_root = data_root / "val"
+  test_root = data_root / "test"
+  
+  # Validate that required directories exist
+  if not train_root.exists():
+      raise FileNotFoundError(f"Training data directory not found: {train_root}")
+  if not val_root.exists():
+      raise FileNotFoundError(f"Validation data directory not found: {val_root}")
+  
+  # Create datasets
+  print("Creating datasets...")
+  train_ds = UICategoryDataset(train_root, category_to_idx, transform=train_tfms)
+  val_ds = UICategoryDataset(val_root, category_to_idx, transform=eval_tfms)
+  
+  # Create data loaders
+  print("Creating data loaders...")
+  train_loader = DataLoader(
+      train_ds, 
+      batch_size=batch_size, 
+      shuffle=True,
+      num_workers=num_workers, 
+      pin_memory=pin_memory,
+      drop_last=True  # Ensures consistent batch sizes
+  )
+  
+  val_loader = DataLoader(
+      val_ds, 
+      batch_size=batch_size, 
+      shuffle=False,
+      num_workers=num_workers, 
+      pin_memory=pin_memory
+  )
+  
+  # Optional test loader
+  test_loader = None
+  test_ds = None
+  if test_root.exists():
+      print("Creating test dataset...")
+      test_ds = UICategoryDataset(test_root, category_to_idx, transform=eval_tfms)
+      test_loader = DataLoader(
+          test_ds, 
+          batch_size=batch_size, 
+          shuffle=False,
+          num_workers=num_workers, 
+          pin_memory=pin_memory
+      )
+  
+  # Create dataset information
+  dataset_info = {
+      "train_size": len(train_ds),
+      "val_size": len(val_ds),
+      "test_size": len(test_ds) if test_ds else 0,
+      "num_categories": len(category_to_idx),
+      "categories": list(category_to_idx.keys()),
+      "batch_size": batch_size,
+      "image_size": image_size,
+      "num_workers": num_workers,
+      "pin_memory": pin_memory,
+      "train_batches": len(train_loader),
+      "val_batches": len(val_loader),
+      "test_batches": len(test_loader) if test_loader else 0,
+      "category_distribution": {
+          "train": dict(train_ds.category_counts),
+          "val": dict(val_ds.category_counts),
+          "test": dict(test_ds.category_counts) if test_ds else {}
+      }
+  }
+  
+  # Transform configuration
+  transform_configs = {
+      "augmentation_strength": augmentation_strength,
+      "normalization_type": normalization_type,
+      "normalization_params": get_normalization_params(normalization_type),
+      "image_size": image_size,
+      "train_transforms": str(train_tfms),
+      "eval_transforms": str(eval_tfms)
+  }
+  
+  # Print summary
+  print("\n" + "="*50)
+  print("DATALOADER SETUP SUMMARY")
+  print("="*50)
+  print(f"Training dataset: {len(train_ds):,} samples ({len(train_loader)} batches)")
+  print(f"Validation dataset: {len(val_ds):,} samples ({len(val_loader)} batches)")
+  if test_loader:
+      print(f"Test dataset: {len(test_ds):,} samples ({len(test_loader)} batches)")
+  print(f"Number of categories: {len(category_to_idx)}")
+  print(f"Batch size: {batch_size}")
+  print(f"Image size: {image_size}x{image_size}")
+  print(f"Augmentation: {augmentation_strength}")
+  print(f"Normalization: {normalization_type}")
+  print(f"Workers: {num_workers}, Pin memory: {pin_memory}")
+  
+  # Validate a sample batch
+  try:
+      sample_batch = next(iter(train_loader))
+      images, labels = sample_batch
+      print(f"\nSample batch validation:")
+      print(f"  Images shape: {images.shape}")
+      print(f"  Labels shape: {labels.shape}")
+      print(f"  Image range: [{images.min():.3f}, {images.max():.3f}]")
+      print(f"  Unique labels in batch: {torch.unique(labels).tolist()}")
+  except Exception as e:
+      print(f"Warning: Could not validate sample batch: {e}")
+
+requirements:
+  - torch
+  - torchvision
+  - pillow
+  - pathlib
+  - numpy
+
+tags:
+  - data-loading
+  - pytorch
+  - computer-vision
+  - data-preprocessing
+  - mlops
+
+version: "1.0.0"
