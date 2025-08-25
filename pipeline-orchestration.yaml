@@ -1,0 +1,341 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ui-component-pipeline-orchestration
+  namespace: mobius-ui-comp
+  labels:
+    app: ui-component-classification
+    component: orchestration
+spec:
+  entrypoint: full-pipeline
+  arguments:
+    parameters:
+    - name: dataset-cdn-url
+      description: "CDN URL for the UI component dataset"
+      value: "{{workflow.parameters.dataset-cdn-url}}"
+    - name: output-bucket
+      description: "Output bucket for storing results"
+      value: "{{workflow.parameters.output-bucket}}"
+    - name: wandb-project
+      description: "Weights & Biases project name"
+      value: "ui-component-classification"
+    - name: experiment-name
+      description: "Experiment name for tracking"
+      value: "{{workflow.parameters.experiment-name}}"
+    - name: train-split-ratio
+      description: "Training split ratio"
+      value: "0.7"
+    - name: val-split-ratio
+      description: "Validation split ratio"  
+      value: "0.2"
+    - name: test-split-ratio
+      description: "Test split ratio"
+      value: "0.1"
+    - name: phase1-epochs
+      description: "Number of epochs for Phase 1 training"
+      value: "50"
+    - name: phase2-epochs
+      description: "Number of epochs for Phase 2 training"
+      value: "30"
+    - name: batch-size
+      description: "Batch size for training"
+      value: "32"
+    - name: learning-rate
+      description: "Learning rate for training"
+      value: "0.001"
+    - name: model-registry-url
+      description: "Model registry URL for storing trained models"
+      value: "{{workflow.parameters.model-registry-url}}"
+
+  templates:
+  - name: full-pipeline
+    dag:
+      tasks:
+      - name: setup-requirements
+        template: requirements-step
+        
+      - name: dataset-split
+        template: dataset-split-step
+        arguments:
+          parameters:
+          - name: dataset-cdn-url
+            value: "{{workflow.parameters.dataset-cdn-url}}"
+          - name: train-split-ratio
+            value: "{{workflow.parameters.train-split-ratio}}"
+          - name: val-split-ratio
+            value: "{{workflow.parameters.val-split-ratio}}"
+          - name: test-split-ratio
+            value: "{{workflow.parameters.test-split-ratio}}"
+        depends: "setup-requirements"
+        
+      - name: label-mapping
+        template: label-mapping-step
+        arguments:
+          parameters:
+          - name: dataset-split-output
+            value: "{{tasks.dataset-split.outputs.parameters.split-manifest}}"
+        depends: "dataset-split"
+        
+      - name: dataloader-setup
+        template: dataloader-setup-step
+        arguments:
+          parameters:
+          - name: dataset-split-output
+            value: "{{tasks.dataset-split.outputs.parameters.split-manifest}}"
+          - name: label-mapping-output
+            value: "{{tasks.label-mapping.outputs.parameters.label-mappings}}"
+          - name: batch-size
+            value: "{{workflow.parameters.batch-size}}"
+        depends: "label-mapping"
+        
+      - name: phase1-model-definition
+        template: phase1-model-definition-step
+        arguments:
+          parameters:
+          - name: num-categories
+            value: "{{tasks.label-mapping.outputs.parameters.num-categories}}"
+        depends: "label-mapping"
+        
+      - name: phase1-training
+        template: phase1-training-step
+        arguments:
+          parameters:
+          - name: model-config
+            value: "{{tasks.phase1-model-definition.outputs.parameters.model-config}}"
+          - name: dataloader-config
+            value: "{{tasks.dataloader-setup.outputs.parameters.dataloader-config}}"
+          - name: epochs
+            value: "{{workflow.parameters.phase1-epochs}}"
+          - name: learning-rate
+            value: "{{workflow.parameters.learning-rate}}"
+          - name: wandb-project
+            value: "{{workflow.parameters.wandb-project}}"
+          - name: experiment-name
+            value: "{{workflow.parameters.experiment-name}}-phase1"
+        depends: "phase1-model-definition && dataloader-setup"
+        
+      - name: phase1-evaluation
+        template: phase1-evaluation-step
+        arguments:
+          parameters:
+          - name: trained-model-path
+            value: "{{tasks.phase1-training.outputs.parameters.model-path}}"
+          - name: test-dataloader-config
+            value: "{{tasks.dataloader-setup.outputs.parameters.test-dataloader-config}}"
+          - name: label-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.label-mappings}}"
+        depends: "phase1-training"
+        
+      - name: phase2-model-definition
+        template: phase2-model-definition-step
+        arguments:
+          parameters:
+          - name: category-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.category-mappings}}"
+          - name: component-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.component-mappings}}"
+        depends: "phase1-evaluation"
+        
+      - name: phase2-training
+        template: phase2-training-step
+        arguments:
+          parameters:
+          - name: model-configs
+            value: "{{tasks.phase2-model-definition.outputs.parameters.model-configs}}"
+          - name: dataloader-config
+            value: "{{tasks.dataloader-setup.outputs.parameters.dataloader-config}}"
+          - name: epochs
+            value: "{{workflow.parameters.phase2-epochs}}"
+          - name: learning-rate
+            value: "{{workflow.parameters.learning-rate}}"
+          - name: wandb-project
+            value: "{{workflow.parameters.wandb-project}}"
+          - name: experiment-name
+            value: "{{workflow.parameters.experiment-name}}-phase2"
+        depends: "phase2-model-definition"
+        
+      - name: phase2-evaluation
+        template: phase2-evaluation-step
+        arguments:
+          parameters:
+          - name: trained-model-paths
+            value: "{{tasks.phase2-training.outputs.parameters.model-paths}}"
+          - name: test-dataloader-config
+            value: "{{tasks.dataloader-setup.outputs.parameters.test-dataloader-config}}"
+          - name: component-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.component-mappings}}"
+        depends: "phase2-training"
+        
+      - name: router-integration
+        template: router-integration-step
+        arguments:
+          parameters:
+          - name: phase1-model-path
+            value: "{{tasks.phase1-training.outputs.parameters.model-path}}"
+          - name: phase2-model-paths
+            value: "{{tasks.phase2-training.outputs.parameters.model-paths}}"
+          - name: label-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.label-mappings}}"
+          - name: category-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.category-mappings}}"
+          - name: component-mappings
+            value: "{{tasks.label-mapping.outputs.parameters.component-mappings}}"
+        depends: "phase2-evaluation"
+        
+      - name: final-evaluation
+        template: final-evaluation-step
+        arguments:
+          parameters:
+          - name: router-model-path
+            value: "{{tasks.router-integration.outputs.parameters.router-model-path}}"
+          - name: test-dataloader-config
+            value: "{{tasks.dataloader-setup.outputs.parameters.test-dataloader-config}}"
+          - name: phase1-metrics
+            value: "{{tasks.phase1-evaluation.outputs.parameters.evaluation-metrics}}"
+          - name: phase2-metrics
+            value: "{{tasks.phase2-evaluation.outputs.parameters.evaluation-metrics}}"
+        depends: "router-integration"
+        
+      - name: model-registry-upload
+        template: model-registry-step
+        arguments:
+          parameters:
+          - name: router-model-path
+            value: "{{tasks.router-integration.outputs.parameters.router-model-path}}"
+          - name: model-registry-url
+            value: "{{workflow.parameters.model-registry-url}}"
+          - name: final-metrics
+            value: "{{tasks.final-evaluation.outputs.parameters.final-metrics}}"
+          - name: experiment-name
+            value: "{{workflow.parameters.experiment-name}}"
+        depends: "final-evaluation"
+
+  # Template definitions for each step
+  - name: requirements-step
+    templateRef:
+      name: requirements-management
+      template: install-requirements
+  
+  - name: dataset-split-step
+    templateRef:
+      name: dataset-split-brick
+      template: split-dataset
+      
+  - name: label-mapping-step
+    templateRef:
+      name: label-mapping-brick
+      template: create-mappings
+      
+  - name: dataloader-setup-step
+    templateRef:
+      name: dataloader-setup-brick
+      template: setup-dataloaders
+      
+  - name: phase1-model-definition-step
+    templateRef:
+      name: phase1-model-definition-brick
+      template: define-resnet-model
+      
+  - name: phase1-training-step
+    templateRef:
+      name: phase1-training-brick
+      template: train-resnet-model
+      
+  - name: phase1-evaluation-step
+    templateRef:
+      name: phase1-evaluation-brick
+      template: evaluate-resnet-model
+      
+  - name: phase2-model-definition-step
+    templateRef:
+      name: phase2-model-definition-brick
+      template: define-clip-models
+      
+  - name: phase2-training-step
+    templateRef:
+      name: phase2-training-brick
+      template: train-clip-models
+      
+  - name: phase2-evaluation-step
+    templateRef:
+      name: phase2-evaluation-brick
+      template: evaluate-clip-models
+      
+  - name: router-integration-step
+    templateRef:
+      name: router-integration-brick
+      template: integrate-router
+      
+  - name: final-evaluation-step
+    templateRef:
+      name: final-evaluation-brick
+      template: evaluate-final-pipeline
+      
+  - name: model-registry-step
+    templateRef:
+      name: model-registry-brick
+      template: register-model
+
+  # Global outputs
+  outputs:
+    parameters:
+    - name: pipeline-status
+      description: "Overall pipeline execution status"
+      valueFrom:
+        parameter: "{{tasks.model-registry-upload.outputs.parameters.registry-status}}"
+    - name: final-model-path
+      description: "Path to the final registered model"
+      valueFrom:
+        parameter: "{{tasks.model-registry-upload.outputs.parameters.registered-model-path}}"
+    - name: pipeline-metrics
+      description: "Comprehensive pipeline metrics"
+      valueFrom:
+        parameter: "{{tasks.final-evaluation.outputs.parameters.final-metrics}}"
+    - name: experiment-id
+      description: "Unique experiment identifier"
+      valueFrom:
+        parameter: "{{tasks.router-integration.outputs.parameters.experiment-id}}"
+
+  # Error handling and retry policies
+  retryStrategy:
+    limit: "3"
+    retryPolicy: "Always"
+    
+  # Workflow-level resource management
+  podGC:
+    strategy: OnPodCompletion
+    
+  # Parallelism and resource limits
+  parallelism: 3
+  
+  # Archive logs and outputs
+  archiveLogs: true
+  
+  # Workflow timeout (6 hours)
+  activeDeadlineSeconds: 21600
+  
+  # Volume claims for shared storage
+  volumeClaimTemplates:
+  - metadata:
+      name: workspace
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 100Gi
+  - metadata:
+      name: model-cache
+    spec:
+      accessModes: [ "ReadWriteOnce" ]
+      resources:
+        requests:
+          storage: 50Gi
+
+  # Environment variables for all templates
+  volumes:
+  - name: shared-config
+    configMap:
+      name: ui-component-pipeline-config
+  - name: secrets
+    secret:
+      secretName: ui-component-pipeline-secrets
